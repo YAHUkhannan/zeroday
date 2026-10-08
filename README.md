@@ -39,6 +39,19 @@ followed by a non-zero package count.
 
 ## Changelog
 
+### 1.0.6
+
+- Download start is faster. The codes a title's depots need are now requested in
+  parallel as soon as the client hands over the depot list, instead of one at a
+  time as the download asks for each in turn.
+- A second local key file is consulted when the main one has no key for a depot.
+- New `InjectedDepots` setting, for titles whose depot list the store withholds.
+- Requests to the code and ticket stores now have a total timeout, not only a
+  connection timeout, so a silent server can no longer hold a worker open.
+- A ticket store that answers "no donor" is no longer retried five times over.
+- Fixed the manifest-code cache file, which could be written as invalid JSON.
+- Removed an inert probe from the code path.
+
 ### 1.0.5
 
 - Cached tickets are now age-checked. Previously only a missing ticket triggered
