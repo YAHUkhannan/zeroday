@@ -39,6 +39,18 @@ followed by a non-zero package count.
 
 ## Changelog
 
+### 1.0.8
+
+- The client library now depends on nothing beyond the C++ runtime and libc. It
+  linked curl, OpenSSL and libgomp while using no symbol from any of them, and
+  those are not guaranteed to be present where it loads — Steam's own runtime
+  ships OpenSSL 1.0, so a machine without 3.x would fail to load it at all.
+- The installer handles a read-only system image, as SteamOS has: it asks SteamOS
+  for a writable `/usr` only when it needs to write there, and says so.
+- The repair script compares the launcher against its patched copy instead of a
+  revision string that named an older revision. That check always reported "not
+  patched", so every login rewrote a good launcher and left a backup behind.
+
 ### 1.0.7
 
 - Achievements now load for games added with the mod, on the library page and in
