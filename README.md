@@ -39,6 +39,16 @@ followed by a non-zero package count.
 
 ## Changelog
 
+### 1.0.9
+
+- The installer now installs the login-time repair as well, and removes it on
+  uninstall. Until now only machines where it had been added by hand had one, so
+  an install without it would quietly stop loading the mod after a SteamOS image
+  update put the stock launcher and `bin_steam.sh` back.
+- `--uninstall` works on a read-only system image, and reports a restore that
+  failed instead of claiming success. Its launcher, `bin_steam.sh` and hook steps
+  were guarded so a write failure went unreported.
+
 ### 1.0.8
 
 - The client library now depends on nothing beyond the C++ runtime and libc. It
