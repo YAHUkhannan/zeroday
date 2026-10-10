@@ -39,6 +39,15 @@ followed by a non-zero package count.
 
 ## Changelog
 
+### 1.0.7
+
+- Achievements now load for games added with the mod, on the library page and in
+  game. The client's own stats request is made first: a title the account owns is
+  served exactly as before, and one it does not own falls back to the shared
+  achievement schema.
+- Fixed the ownership check that path used. It asked the client, which reports
+  added titles as owned, so it skipped precisely the games the feature exists for.
+
 ### 1.0.6
 
 - Download start is faster. The codes a title's depots need are now requested in
