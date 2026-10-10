@@ -39,6 +39,16 @@ followed by a non-zero package count.
 
 ## Changelog
 
+### 1.0.11
+
+- A new install now comes with the remote depot-key vault enabled. It shipped
+  disabled and with no key file, so the key lookup had nothing to fall back on and
+  every added title answered `Missing decryption key` — the library filled up and
+  the downloads never started. The local `depotkeys.json` is still consulted
+  first, so this only covers depots that file does not have.
+- Existing installs keep the value they already have. The config merge only adds
+  keys the file lacks; it never overwrites one that is already set.
+
 ### 1.0.10
 
 - The installer now lays down the patched launcher the repair restores *from*.
