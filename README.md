@@ -39,6 +39,15 @@ followed by a non-zero package count.
 
 ## Changelog
 
+### 1.0.10
+
+- The installer now lays down the patched launcher the repair restores *from*.
+  Without it a repair reported "canonical or jupiter missing" and did nothing, so
+  the stock launcher — the one that runs `rm -rf --one-file-system "$STEAM_DIR"` —
+  came back after a Steam or system update and stayed. Uninstall removes it again.
+- The repair script takes the same path overrides as the installer, and probes for
+  a writable `/usr` beside the launcher instead of at a fixed path.
+
 ### 1.0.9
 
 - The installer now installs the login-time repair as well, and removes it on
