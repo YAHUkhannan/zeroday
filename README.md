@@ -39,6 +39,22 @@ followed by a non-zero package count.
 
 ## Changelog
 
+### 1.1.2
+
+- Fixed titles that were injected but never showed up in the library. A title
+  appears because the client is handed a licence for a *package* that contains it,
+  and the writer used only the first package the store API returned — and wrote
+  nothing at all when the API withheld its package list, which is what happens for
+  delisted, region-locked and publisher-removed titles. It now uses every package
+  (up to three), falls back to the package groups, then to the store page, then to
+  an override file (`~/.config/ZeroDay/packages.json`) for titles the store still
+  refuses to answer for.
+- The panel no longer reports "Successfully Injected" when nothing usable was
+  written. A title with no package id says so, and is not marked ADDED.
+- `zeroday-doctor.sh` ships alongside: a report, `check <appid>`, `lookup <appid>`
+  and `add <appid> <packageid> "Name"`, which writes a missing entry with a backup
+  beside the config. The mod picks config changes up live, no restart needed.
+
 ### 1.1.1
 
 - The Decky plugin in the payload is now the build running here. It drops the
