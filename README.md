@@ -39,6 +39,14 @@ followed by a non-zero package count.
 
 ## Changelog
 
+### 1.1.3
+
+- `zeroday-doctor.sh` gained `bundle`: one command that prints the report, which
+  plugin build is installed, what was injected last and the mod's own log. Send that
+  when a title did not appear — it separates "old plugin build" from "no package id
+  for that title" from "the mod is not loading on this client".
+- The plugin, the installer and the payload are unchanged from 1.1.2.
+
 ### 1.1.2
 
 - Fixed titles that were injected but never showed up in the library. A title
