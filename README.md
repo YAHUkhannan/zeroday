@@ -39,6 +39,26 @@ followed by a non-zero package count.
 
 ## Changelog
 
+### 1.1.4
+
+- Fixed downloads that stalled at "Update Queued" and never began, with every
+  content server answering 401. A manifest request code is only good for a few
+  minutes and a previously fetched one was being replayed indefinitely, because it
+  was cached on disk with no record of its age. Cached codes now record when they
+  were fetched and are replaced once older than 20 minutes; a code written by an
+  earlier build carries no timestamp and is treated as expired rather than used.
+- Added `MrcExtraServers`: additional code sources tried in order after
+  `MrcServer`. A source that fails, times out, or returns something that is not a
+  code is skipped and the next is asked, so one bad provider no longer fails a
+  download by itself.
+- The local code proxy asks all of its providers at once instead of one after
+  another. A failing provider used to consume the whole request before the next
+  was tried; measured time to a usable code fell from 11-12 s to 5-8 s.
+- The client thread is no longer held while a code is fetched — it is served from
+  the cache or not at all, and fetching happens on a worker thread.
+- Existing installs keep their current settings; the only template change is the
+  added `MrcExtraServers` entry, which defaults to on.
+
 ### 1.1.3
 
 - `zeroday-doctor.sh` gained `bundle`: one command that prints the report, which
