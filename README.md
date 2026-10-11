@@ -39,6 +39,14 @@ followed by a non-zero package count.
 
 ## Changelog
 
+### 1.1.1
+
+- The Decky plugin in the payload is now the build running here. It drops the
+  leftover "Added by Wally" collection tagging — the panel no longer creates or
+  fills a collection named after the previous project — and fixes a stale line in
+  the backend docstring. 1.1.0 shipped the older copy, so its panel still tagged
+  added titles into that collection.
+
 ### 1.1.0
 
 - A new install now comes up configured the way it is meant to run: `SmartTickets`
