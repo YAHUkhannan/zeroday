@@ -39,6 +39,32 @@ followed by a non-zero package count.
 
 ## Changelog
 
+### 1.1.0
+
+- A new install now comes up configured the way it is meant to run: `SmartTickets`
+  covers SteamDRM and Denuvo, cloud saves stay enabled, and the log level is the
+  quiet one.
+- The installer ships the local manifest-code proxy and runs it. `MrcServer` points
+  at `http://127.0.0.1:9080/manifest/`; `zeroday-mrc-proxy.service` starts at login,
+  asks several public code providers in order, retries the flaky ones and caches
+  what it gets for a minute. Steam refuses to issue a code for a title the account
+  does not own, and without one every content server answers 401 — that is what
+  breaks downloads.
+- If the proxy cannot run — no python3, or the service does not come up — the
+  installer points `MrcServer` at the public provider instead and says so, rather
+  than leaving the mod talking to a closed port. An install that set its own
+  `MrcServer` is never rewritten.
+- Decky Loader is left alone when it is already there. Detection accepts any of its
+  usual pieces, and if `~/homebrew` exists at all the installer will not run
+  Decky's own installer over it. Only a machine without Decky gets Decky
+  installed — before the plugin, so the plugin has somewhere to go — and the
+  plugin step no longer aborts when `~/homebrew/plugins` does not exist yet.
+- Fixed the Decky restart. The unit is `KillMode=process`, so stopping it left the
+  loader it had spawned running and the new instance fought it over the same plugin
+  sockets. The installer now drains the loader as well as the plugin hosts, and
+  reaps what is left through sudo, so root-owned hosts die too.
+- `--uninstall` removes the proxy unit and script along with everything else.
+
 ### 1.0.11
 
 - A new install now comes with the remote depot-key vault enabled. It shipped
