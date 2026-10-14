@@ -34,10 +34,36 @@ copy it before closing Steam if you need the previous session.
 tail -100 ~/.ZeroDay.log | grep -E "License|Pkg|Error|pattern"
 ```
 
-A healthy start looks like 23 patterns resolved, 0 aborts, and `License: injected`
-followed by a non-zero package count.
+A healthy start looks like `Loaded successfully` and `Hooks: 46 of 46 placed`.
 
 ## Changelog
+
+### 1.1.6
+
+- A Denuvo launch now gets the cached ownership ticket before the game reads it.
+  The encrypted half and the ownership half name the same account. Previously the
+  game could be handed this account's empty ticket while the encrypted half named
+  the donor.
+- A download that Steam pauses for a shader update is put back on the schedule
+  immediately. The bytes already saved stay. Shader retries on a game that is
+  already installed are left alone.
+- A manifest code is requested when Steam asks for that depot, once. The mod no
+  longer asks for a code for every depot of every added game at startup.
+- The code proxy still races its providers and still retries one that fails fast.
+  It no longer treats a provider as refused at the moment it hands a code out.
+- The plugin toast says what the grab just wrote (`Added {name}`), not that the
+  game was already in the config. Manage → Remove game deletes the app line, the
+  package line, and the cached ticket, so Steam's Uninstall stays done. A grab no
+  longer appends depot ids.
+- Ticket files in the cache are picked up without restarting Steam. Remuvo uses
+  that. The config already reloaded this way.
+
+### 1.1.5
+
+- Fixed the crash a few seconds after launch on the current Steam client. A skipped
+  hook is now a pass-through, never an empty pointer.
+- Achievements are fetched on both of the client's stats paths again.
+- Opening a game no longer hangs the library page.
 
 ### 1.1.4
 
