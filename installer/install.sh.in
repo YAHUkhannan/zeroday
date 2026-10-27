@@ -7,8 +7,8 @@
 # What it does, in order:
 #   1. works out what kind of machine this is (SteamOS / Bazzite / CachyOS / Arch / other)
 #   2. downloads the payload and verifies its checksum
-#   3. CLOSES STEAM and waits for it to actually be gone
-#   4. installs the libraries, merges the config, patches the launcher, installs the Decky plugin
+#   3. checks Steam compatibility, then CLOSES STEAM and applies a supported update if needed
+#   4. verifies the client, installs the libraries, config, launcher and optional Decky plugin
 #   5. starts Steam again
 #
 # After that there is nothing to configure: open the store and grab a game.
@@ -22,6 +22,8 @@
 #   --no-plugin      skip the Decky plugin
 #   --no-restart     leave Steam stopped when we are done
 #   --yes            skip the interactive screen
+#   --check          report Steam compatibility without installing
+#   --update-steam-anyway  allow an unsupported Steam update; leave ZeroDay disabled
 #   -h, --help       this text
 #
 # Notes for whoever reads this next:
@@ -37,7 +39,8 @@ set -euo pipefail
 
 # --------------------------------------------------------------------- config
 # Release base URL. Override with --repo or ZERODAY_REPO.
-ZERODAY_REPO="${ZERODAY_REPO:-https://github.com/YAHUkhannan/zeroday/releases/latest/download}"
+ZERODAY_REPO="${ZERODAY_REPO:-https://github.com/YAHUkhannan/zeroday/releases/download/v@ZERODAY_VERSION@}"
+ZERODAY_VERSION="@ZERODAY_VERSION@"
 PAYLOAD_NAME="ZeroDay-payload.tar.gz"
 SUMS_NAME="SHA256SUMS"
 
@@ -57,7 +60,7 @@ REPATCH_DST="${ZERODAY_REPATCH_DST:-/usr/local/bin/zeroday-repatch.sh}"
 HOOK_DST="${ZERODAY_HOOK_DST:-/etc/pacman.d/hooks/zeroday-steam.hook}"
 DMI_ROOT="${ZERODAY_DMI_ROOT:-/sys/devices/virtual/dmi/id}"
 
-AUDIT_LINE='export LD_AUDIT="$HOME/.local/share/ZeroDay/library-inject.so:$HOME/.local/share/ZeroDay/ZeroDay.so"; export STEAM_FORCE_CLIENT=steamrt64'
+AUDIT_LINE='export LD_AUDIT="$HOME/.local/share/ZeroDay/library-inject.so:$HOME/.local/share/ZeroDay/ZeroDay.so"; if [ -f "$HOME/.local/share/ZeroDay/client-update-pending" ]; then unset LD_AUDIT; fi; export STEAM_FORCE_CLIENT=steamrt64'
 
 DECKY_PLUGINS="${ZERODAY_DECKY_PLUGINS:-$HOME/homebrew/plugins}"
 DECKY_PLUGIN_NAME="ZeroDay"
@@ -92,6 +95,9 @@ usage() {
 		  --no-plugin      skip the Decky plugin
 		  --no-restart     leave Steam stopped when finished
 		  --yes, -y        never prompt
+		  --check          report Steam compatibility without installing
+		  --version        print the installer version
+		  --update-steam-anyway  update unsupported Steam; leave ZeroDay disabled
 		  -h, --help       this text
 
 		It closes Steam first, installs everything, then starts Steam again.
@@ -107,6 +113,8 @@ OPT_UNINSTALL=0
 OPT_PLUGIN=1
 OPT_RESTART=1
 OPT_YES=0
+OPT_CHECK=0
+OPT_UPDATE_ANYWAY=0
 
 while [ $# -gt 0 ]; do
 	case "$1" in
@@ -118,6 +126,9 @@ while [ $# -gt 0 ]; do
 		--no-plugin) OPT_PLUGIN=0; shift ;;
 		--no-restart) OPT_RESTART=0; shift ;;
 		--yes|-y) OPT_YES=1; shift ;;
+		--check) OPT_CHECK=1; shift ;;
+		--version) printf '%s\n' "$ZERODAY_VERSION"; exit 0 ;;
+		--update-steam-anyway) OPT_UPDATE_ANYWAY=1; shift ;;
 		-h|--help) usage; exit 0 ;;
 		*) echo "unknown flag: $1" >&2; exit 2 ;;
 	esac
@@ -127,10 +138,13 @@ done
 
 # @ZERODAY_UI@
 
+# @ZERODAY_COMPAT@
+
 ui_floor_step() {
 	local n=0
 	case "$1" in
 		"Fetching the payload") n=80 ;;
+		"Checking Steam compatibility") n=545 ;;
 		"Closing Steam") n=560 ;;
 		"Migrating your existing SLSsteam install") n=640 ;;
 		"Installing libraries") n=700 ;;
@@ -303,6 +317,10 @@ PATCHED_JUPITER=0
 TX_DIR=""
 TX_ACTIVE=0
 WORK_OWNED=0
+CLIENT_WORK=""
+CLIENT_UPDATE=0
+CLIENT_SUPPORTED=1
+STEAM_UPDATE_STARTED=0
 declare -a TX_PATHS=() TX_PRESENT=()
 
 track_path() {
@@ -322,6 +340,7 @@ begin_transaction() {
 	for path in "$ZERODAY_LIB" "$ZERODAY_INJECT" "$ZERODAY_DIR/wudrm-proxy.py" \
 		"$CONFIG_DIR" "$JUPITER" "$JUPITER_CANON" "$BIN_STEAM" "$REPATCH_DST" "$HOOK_DST" \
 		"$STEAM_ROOT/.steam-enable-steamrt64-client" "$ZERODAY_DIR/created-steamrt64-marker" \
+		"$ZERODAY_DIR/client-update-pending" \
 		"$HOME/.config/systemd/user/zeroday-repatch.service" \
 		"$HOME/.config/systemd/user/zeroday-mrc-proxy.service" \
 		"$HOME/.config/systemd/user/default.target.wants/zeroday-mrc-proxy.service" \
@@ -350,6 +369,11 @@ cleanup_on_failure() {
 		printf '%s\n' 'Installation failed; restoring the previous files.' >&2
 		for ((index=${#TX_PATHS[@]}-1; index>=0; index--)); do
 			path=${TX_PATHS[index]}
+			# Steam itself cannot be rolled back by a mod-file transaction. Keep the
+			# guarded entrypoints after an attempted update, including a partial one.
+			if [ "$STEAM_UPDATE_STARTED" -eq 1 ]; then
+				case "$path" in "$JUPITER"|"$JUPITER_CANON"|"$BIN_STEAM"|"$REPATCH_DST"|"$ZERODAY_DIR/client-update-pending") continue ;; esac
+			fi
 			asroot rm -rf -- "$path" || { restore_failed=1; continue; }
 			if [ "${TX_PRESENT[index]}" -eq 1 ]; then
 				asroot mkdir -p -- "$(dirname "$path")" &&
@@ -366,12 +390,17 @@ cleanup_on_failure() {
 			fi
 		fi
 	fi
+	if [ "$STEAM_UPDATE_STARTED" -eq 1 ] && [ "$rc" -ne 0 ]; then
+		touch "$ZERODAY_DIR/client-update-pending"
+		printf '%s\n' 'Steam update was attempted. ZeroDay stays disabled until a compatible installation succeeds.' >&2
+	fi
 	if [ "$restore_failed" -eq 1 ]; then
 		printf 'Some files could not be restored. Recovery copies are kept at: %s\n' "$TX_DIR" >&2
 	else
 		[ -z "$TX_DIR" ] || asroot rm -rf -- "$TX_DIR" || true
 	fi
 	if [ "$WORK_OWNED" -eq 1 ] && [ -n "$WORK" ]; then rm -rf -- "$WORK"; fi
+	[ -z "$CLIENT_WORK" ] || rm -rf -- "$CLIENT_WORK"
 	if [ "$rc" -ne 0 ]; then printf 'Installation failed (exit %s). Log: %s\n' "$rc" "$ZERODAY_LOG" >&2; fi
 	exit "$rc"
 }
@@ -751,21 +780,101 @@ install_libs() {
 }
 
 validate_runtime() {
-	# Refuse an incompatible installation before Steam or any user state is touched.
+	# Validate the downloaded libraries before stopping Steam. Client validation
+	# follows separately, so an older Steam can be updated by its own bootstrapper.
 	command -v python3 >/dev/null 2>&1 || die "Python 3 is required"
-	python3 - "$WORK/payload/ZeroDay.so" "$WORK/payload/library-inject.so" \
-		"$STEAM_ROOT/steamrt64/steam" "$STEAM_ROOT/steamrt64/steamclient.so" <<'ELF_CHECK' || die "a complete 64-bit Steam client and matching payload are required; update Steam first"
-import struct, sys
-for name in sys.argv[1:]:
-    try:
-        with open(name, 'rb') as f: header = f.read(20)
-        if len(header) != 20 or header[:6] != b'\x7fELF\x02\x01' or struct.unpack_from('<H', header, 18)[0] != 62:
-            raise ValueError('expected x86-64 ELF')
-    except (OSError, ValueError) as error:
-        print(f'{name}: {error}', file=sys.stderr)
-        sys.exit(1)
-ELF_CHECK
-	[ -x "$STEAM_ROOT/steamrt64/steam" ] || die "64-bit Steam is not executable"
+	steam_compat payload "$WORK/payload" || die "payload does not match this release's validated x86-64 libraries"
+}
+
+confirm_unsupported_update() {
+	local selection=0
+	warn "Available Steam build $CLIENT_BUILD is not supported by ZeroDay $ZERODAY_VERSION."
+	warn "Update Steam anyway leaves ZeroDay disabled until a compatible release is installed."
+	[ "$OPT_UPDATE_ANYWAY" -eq 0 ] || return 0
+	if [ "$INTERACTIVE" -eq 0 ]; then
+		die "cancelled; --yes does not accept unsupported updates. Use --update-steam-anyway to choose that explicitly"
+	fi
+	UI_WORK=0
+	ui_pause
+	stty -echo -icanon min 1 time 0 <&"$UI_FD" 2>/dev/null || true
+	while true; do
+		ui '\033[2J\033[H  ZERODAY  //  Steam compatibility\n\n'
+		ui '  Available Steam build %s is unsupported by ZeroDay %s.\n' "$CLIENT_BUILD" "$ZERODAY_VERSION"
+		ui '  Updating Steam will leave ZeroDay disabled until a compatible release.\n\n'
+		if [ "$selection" -eq 0 ]; then
+			ui '  > Cancel\n    Update Steam anyway\n'
+		else
+			ui '    Cancel\n  > Update Steam anyway\n'
+		fi
+		ui '\n  D-pad/Arrows: choose   A/Enter: confirm   B/Esc: cancel\n'
+		ui_key
+		case "$UI_KEY" in
+			'[A'|'[B'|'[C'|'[D'|w|s|$' ') selection=$((1 - selection)) ;;
+			$'\025') break ;;
+			q|Q|n|N) selection=0; break ;;
+		esac
+	done
+	[ -z "$UI_SAVED_STTY" ] || stty "$UI_SAVED_STTY" <&"$UI_FD" 2>/dev/null || true
+	[ "$selection" -eq 1 ] || die "cancelled; Steam and ZeroDay were left unchanged"
+	ui_draw_progress
+}
+
+check_steam_compatibility() {
+	step "Checking Steam compatibility"
+	local result compatible installed
+	result=$(steam_compat inspect "$STEAM_ROOT") || die "could not inspect the installed Steam client"
+	IFS=$'\t' read -r compatible installed <<< "$result"
+	if [ "$compatible" = 1 ]; then
+		ok "installed Steam build $installed is compatible; updating ZeroDay only"
+		return 0
+	fi
+	warn "installed Steam build $installed needs a compatible native client"
+	CLIENT_WORK=$(mktemp -d)
+	result=$(steam_compat plan "$STEAM_ROOT" "$CLIENT_WORK") || die "could not verify the available Steam update; nothing was changed"
+	IFS=$'\t' read -r CLIENT_BUILD CLIENT_SUPPORTED <<< "$result"
+	CLIENT_UPDATE=1
+	if [ "$CLIENT_SUPPORTED" = 0 ]; then confirm_unsupported_update
+	else ok "Steam build $CLIENT_BUILD is supported and will be installed automatically"
+	fi
+}
+
+guard_existing_launchers() {
+	# Older installed launchers need the same persistent guard as new installs.
+	# The repair source is guarded too, so a package/login repair cannot re-enable
+	# a mod whose client update failed or installed an unsupported build.
+	local path patched
+	for path in "$JUPITER" "$JUPITER_CANON" "$BIN_STEAM"; do
+		[ -f "$path" ] || continue
+		patched=$(mktemp)
+		awk '
+			/^[[:space:]]*export[[:space:]]+LD_AUDIT=.*(SLSsteam|ZeroDay)/ && !/client-update-pending/ {
+				print $0 "; if [ -f \"$HOME/.local/share/ZeroDay/client-update-pending\" ]; then unset LD_AUDIT; fi"; next
+			}
+			{print}
+		' "$path" > "$patched"
+		if ! cmp -s "$patched" "$path"; then
+			asroot cp -p "$path" "$path.bak-zeroday-$TS" || die "could not back up $path"
+			asroot install -m 0755 "$patched" "$path" || die "could not guard $path for the Steam update"
+		fi
+		rm -f "$patched"
+	done
+}
+
+update_steam_client() {
+	[ "$CLIENT_UPDATE" -eq 1 ] || return 0
+	ensure_system_writable
+	guard_existing_launchers
+	# An older repair script would put its unguarded audit line back at login.
+	if [ -f "$REPATCH_DST" ]; then
+		asroot install -m 0755 "$WORK/payload/zeroday-repatch.sh" "$REPATCH_DST" \
+			|| die "could not update launcher repair before the Steam update"
+	fi
+	touch "$ZERODAY_DIR/client-update-pending"
+	STEAM_UPDATE_STARTED=1
+	step "Updating Steam"
+	steam_compat update "$STEAM_ROOT" "$CLIENT_WORK" >> "$ZERODAY_LOG" 2>&1 \
+		|| die "Steam update failed verification; ZeroDay stays disabled. See $ZERODAY_LOG"
+	ok "Steam build $CLIENT_BUILD updated and checked"
 }
 
 select_runtime() {
@@ -1252,6 +1361,7 @@ main() {
 	trap 'ui_restore; exit 130' INT
 	trap 'ui_restore; exit 143' TERM
 	if [ "$OPT_PREVIEW" -eq 1 ]; then ui_preview; return; fi
+	if [ "$OPT_CHECK" -eq 1 ]; then steam_compat check "$HOME"; return; fi
 	trap cleanup_on_failure EXIT
 	mkdir -p "$ZERODAY_DIR"
 	exec 8>"$ZERODAY_DIR/install.lock"
@@ -1290,9 +1400,20 @@ main() {
 
 	fetch_payload
 	validate_runtime
+	check_steam_compatibility
 	begin_transaction
 
 	stop_steam
+	update_steam_client
+	if [ "$CLIENT_SUPPORTED" -eq 0 ]; then
+		select_runtime
+		TX_ACTIVE=0
+		start_steam
+		step "Done"
+		warn "Steam was updated. ZeroDay was not installed and remains disabled until a compatible release is available."
+		ui_hold
+		return 0
+	fi
 
 	# Before anything is written: rescue the user's state out of a previous
 	# SLSsteam install and clear the old libraries out of the way.
@@ -1319,6 +1440,7 @@ main() {
 
 	# Everything landed. Disarm the rollback. Keep the terminal restore on the
 	# way out if we have not already put the screen back.
+	rm -f "$ZERODAY_DIR/client-update-pending"
 	TX_ACTIVE=0
 
 	start_steam

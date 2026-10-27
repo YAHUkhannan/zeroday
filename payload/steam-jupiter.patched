@@ -1,0 +1,109 @@
+#!/bin/bash
+
+set -euo pipefail
+
+# zeroday-jupiter-revision: 9
+
+steam_pids() {
+	local pid stat
+	# Exclude this launcher and its parent shells, which can also be named steam.
+	for pid in $(pgrep -A -u "$(id -u)" -x steam 2>/dev/null || true); do
+		stat=$(ps -o stat= -p "$pid" 2>/dev/null | tr -d '[:space:]')
+		case "$stat" in Z*|"") ;; *) printf '%s\n' "$pid" ;; esac
+	done
+}
+
+# Quit the current client without launching a forwarding client.
+for arg in "$@"; do
+	if [ "$arg" = "-shutdown" ]; then
+		for pid in $(steam_pids); do
+			kill -TERM "$pid" 2>/dev/null || true
+		done
+		exit 0
+	fi
+done
+
+# A desktop click while a client is already up must not start a second one.
+# The second one forwards into SteamBootstrapper_GetForwardedCommandLine and
+# the open client segfaults. Raise the window instead.
+# Game Mode is different. Its service has to be the Steam process. Exiting
+# here leaves gamescope with no client, the stop script calls pgrep with no
+# pid, and the session gives up.
+gamepad=0
+for arg in "$@"; do
+	if [ "$arg" = "-gamepadui" ]; then
+		gamepad=1
+	fi
+done
+if [ "$gamepad" -eq 0 ] && [ -n "$(steam_pids)" ]; then
+	# xdotool's class/name search does not match this Wayland window. The
+	# minimized client is resourceClass "steam", caption "Steam", and a click
+	# has to unminimize it. A second client is still not started.
+	raise_js="$HOME/.local/share/zeroday/steam-raise.js"
+	if [ -f "$raise_js" ] && command -v qdbus6 >/dev/null 2>&1; then
+		# A repeated plugin name does not run again. Each click needs its own.
+		plugin="steamraise$$"
+		raise_id=$(qdbus6 org.kde.KWin /Scripting loadScript "$raise_js" "$plugin" 2>/dev/null || true)
+		if [ -n "${raise_id:-}" ]; then
+			qdbus6 org.kde.KWin "/Scripting/Script${raise_id}" org.kde.kwin.Script.run >/dev/null 2>&1 || true
+		fi
+		qdbus6 org.kde.KWin /Scripting unloadScript "$plugin" >/dev/null 2>&1 || true
+	fi
+	exit 0
+fi
+
+STEAM_LINKS="$HOME"/.steam
+STEAM_DIR="$HOME"/.local/share/Steam
+
+REGISTRY="$STEAM_LINKS"/registry.vdf
+REGISTRY_BAK="$HOME"/.local/share/steam_registry_oobe.vdf
+
+(
+  if [[ -f "$STEAM_DIR"/Steam.cfg ]] && grep -q "^# OOBE Inhibit" "$STEAM_DIR"/Steam.cfg; then
+    # If steam is setup in an OOBE fashion, we want to blow it away and re-bootstrap
+    # See steam-jupiter-oobe's variant of this entrypoint.
+
+    # Move the registry to a oobe backup copy (keep — harmless)
+    [[ ! -e "$REGISTRY" ]] || cp -v "$REGISTRY" "$REGISTRY_BAK"
+
+    # WIPE DISABLED (ZeroDay): never delete the Steam install on OOBE markers
+  fi
+
+  # If we're bootstrapping a fresh instance of Steam, use the oobe registry.vdf if we have it
+  if [[ -e "$REGISTRY_BAK" && ! -e "$REGISTRY" ]]; then
+    mkdir -pv "$STEAM_LINKS"
+    cp -v "$REGISTRY_BAK" "$REGISTRY"
+  fi
+
+  # For beta lifecycle, we need to be on a steampal branch.
+  if cd ~/.steam/root/package || cd ~/.local/share/Steam/package; then
+    if [[ ! -e beta || $(cat beta) = *neptune || $(cat beta) = publicbeta || $(cat beta) = "steampal_stable_d89c8fc0c37b9f06864d20456852ed2eb7e350b3" ]]; then
+      # CHANNEL-FORCE DISABLED (ZeroDay): never flip the client to steamdeck_stable
+      :
+    fi
+  fi
+)
+
+# STRIP STEAMPAL FLAGS (ZeroDay): -steampal makes the client self-select the
+# steamdeck_stable channel and rewrite package/beta.
+#
+# -steamos3 is deliberately KEPT. Revision 2 (2026-10-04) stripped it too and
+# that silently broke Game Mode -> Desktop: the flag gates SteamOS-mode client
+# behaviours, and without it the client stops running the session-select helper,
+# so the teardown happened with autologin still set to gamescope and nothing
+# came up. The channel-rewrite concern is already handled by the disabled
+# block above, so stripping this bought nothing and cost the switch.
+FILTERED_ARGS=()
+for arg in "$@"; do
+	case "$arg" in
+		-steampal) ;;
+		*) FILTERED_ARGS+=("$arg") ;;
+	esac
+done
+
+export LD_AUDIT="$HOME/.local/share/ZeroDay/library-inject.so:$HOME/.local/share/ZeroDay/ZeroDay.so"; if [ -f "$HOME/.local/share/ZeroDay/client-update-pending" ]; then unset LD_AUDIT; fi
+export STEAM_FORCE_CLIENT=steamrt64
+# Jupiter is the Deck/SteamOS entrypoint. Preserve the hardware flag in desktop
+# mode too: dropping it disables the Deck's on-screen keyboard chord. The
+# separate -gamepadui argument chooses Game Mode's interface.
+exec /usr/lib/steam/steam -steamdeck "${FILTERED_ARGS[@]}"

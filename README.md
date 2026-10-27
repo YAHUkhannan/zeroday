@@ -25,8 +25,13 @@ curl -fsSL https://github.com/YAHUkhannan/zeroday/releases/latest/download/insta
 Choose **Install**. The installer handles setup and restarts Steam when it is
 finished. Existing settings, keys and ticket cache are preserved.
 
-**Requires:** Linux x86-64, Python 3, curl and the native 64-bit Steam client.
+**Requires:** Linux x86-64, Python 3, curl and an installed Steam client.
 Pillow enables the artwork; a text interface is available without it.
+
+Compatible Steam installations are kept unchanged. When Steam needs an update,
+the installer checks the available build and updates automatically if it is
+supported. An unsupported update offers **Update Steam anyway** or **Cancel**;
+updating anyway leaves ZeroDay disabled.
 
 ## Included
 
@@ -35,11 +40,12 @@ Pillow enables the artwork; a text interface is available without it.
 - Steam Deck support in Desktop Mode and Game Mode.
 - An animated installer with menu sounds, launcher repair and recovery on failure.
 
-## First stable release
+## Latest release
 
-[**ZeroDay v1.1.8**](https://github.com/YAHUkhannan/zeroday/releases/latest)
-is the starting point for this release line, with the complete installer and
-native 64-bit client fixes. Get the installer from the latest release above.
+[**ZeroDay v1.2.0**](https://github.com/YAHUkhannan/zeroday/releases/latest)
+adds Steam compatibility checks and supported automatic updates, and includes
+the latest native reload safeguard. Steam build **1792618285** is validated;
+the installer checks the actual native client and interface files.
 
 ## Documentation
 

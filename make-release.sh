@@ -27,6 +27,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+python3 "$DIST/installer/steam_client.py" payload "$DIST/payload"
 python3 "$DIST/installer-ui/build.py" --template "$DIST/installer/install.sh.in" --output "$DIST/install.sh"
 for script in "$DIST/install.sh" "$DIST/payload/zeroday-repatch.sh" "$DIST/payload/steam-jupiter.patched"; do
     bash -n "$script"

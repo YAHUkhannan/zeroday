@@ -4,11 +4,18 @@
 
 ## Installation
 
-Start with the message printed by the installer. Missing native client files or
-an invalid download are reported before Steam is closed. The installation log is
+Start with the message printed by the installer. Invalid downloads and update
+compatibility choices are reported before Steam is closed. The installation log is
 `~/.local/share/ZeroDay/install.log`.
 
 If a restore fails, keep the recovery directory named in the error message.
+
+Run `bash install.sh --check` for an offline compatibility report. Unsupported
+clients return exit code 3. If a Steam update failed or an unsupported update
+was explicitly chosen, `~/.local/share/ZeroDay/client-update-pending` keeps the
+mod disabled through launcher repairs. Install a compatible release to clear
+that state after verification. Do not delete the marker to force an unsupported
+client to load the mod.
 
 ## Steam and games
 

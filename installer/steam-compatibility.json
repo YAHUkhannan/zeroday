@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "payload": {
+    "ZeroDay.so": "1919e437ec9856653c5cd51f914f8d8d8db68605b879bb0eeae2c04b8ab38f96",
+    "library-inject.so": "2005a9e8a4c18b3f5d3b397a2aaf4600831775701d91a9913cafcae11cb4cc56"
+  },
+  "clients": [
+    {
+      "build": "1792618285",
+      "steamclient_sha256": "17652d599bb46b6f316d59c37215efeb74ef892c8c3e7589df7d766ea3a9efa2",
+      "steamui_sha256": "d4376171a7ffe96bab76f6203b4c65a2f6bff277a9212922b3ca106bf79a3b43"
+    }
+  ]
+}

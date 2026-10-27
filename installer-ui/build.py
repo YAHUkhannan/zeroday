@@ -4,6 +4,7 @@ import argparse
 import base64
 import gzip
 import io
+import json
 from pathlib import Path
 import tarfile
 
@@ -28,8 +29,10 @@ def main():
     source.add_argument("--template", type=Path)
     source.add_argument("--original", type=Path, help="Rebuild an already generated installer")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--compatibility", type=Path, help="Validated client policy (for release maintenance and sandbox tests)")
     args = parser.parse_args()
     ui = Path(__file__).resolve().parent
+    dist = ui.parent
     original = (args.template or args.original).read_text()
     marker = "# @ZERODAY_UI@"
     if marker not in original:
@@ -44,7 +47,16 @@ def main():
                 "ui_archive_b64() {\ncat <<'ZERODAY_UI_ARCHIVE'\n" + encoded +
                 "\nZERODAY_UI_ARCHIVE\n}\n\n" + (ui / "terminal.sh").read_text())
     assert original.count(marker) == 1
-    args.output.write_text(original.replace(marker, embedded))
+    original = original.replace(marker, embedded)
+    if "# @ZERODAY_COMPAT@" in original:
+        policy = json.loads((args.compatibility or dist / "installer/steam-compatibility.json").read_text())
+        checker = (dist / "installer/steam_client.py").read_text().replace(
+            "POLICY = None  # @ZERODAY_STEAM_POLICY@", "POLICY = " + repr(policy))
+        original = original.replace("# @ZERODAY_COMPAT@",
+                                    "steam_compat() {\npython3 - \"$@\" <<'ZERODAY_STEAM_CHECKER'\n" + checker +
+                                    "\nZERODAY_STEAM_CHECKER\n}\n")
+    original = original.replace("@ZERODAY_VERSION@", (dist / "VERSION").read_text().strip())
+    args.output.write_text(original)
     args.output.chmod(0o755)
 
 

@@ -1,4 +1,6 @@
-/payload/
+/payload/*
+!/payload/steam-jupiter.patched
+!/payload/zeroday-repatch.sh
 /release*/
 /install.sh
 __pycache__/
