@@ -10,6 +10,7 @@ Only this process writes the screen, including during blocking installer steps.
 """
 
 import argparse
+import fcntl
 import math
 import os
 from pathlib import Path
@@ -18,8 +19,10 @@ import select
 import shutil
 import signal
 import subprocess
+import struct
 import sys
 import threading
+import termios
 import time
 
 try:
@@ -35,6 +38,8 @@ TRACK = (36, 32, 26)
 ESC = "\x1b"
 MOTION_STEPS = 4  # Quarter-pixel coverage keeps a slow descent from stepping.
 FRAME_PERIOD = 1 / 60
+BAR_SCALE = 0.8
+BAR_FADE_SECONDS = 0.65
 
 
 class Sounds:
@@ -185,11 +190,17 @@ class Artwork:
         gold_canvas.paste(gold, (358, 446))
         self.full.paste(gold_canvas, mask=interior)
         self.cache = {}
+        self.palettes = {}
 
     def fit(self, width, height):
         key = (width, height)
         if key not in self.cache:
-            self.cache.clear()
+            # The banner and the smaller bar share assets at different sizes.
+            # Retain both fits instead of resizing them again on every frame.
+            if len(self.cache) >= 4:
+                oldest = next(iter(self.cache))
+                self.cache.pop(oldest)
+                self.palettes.pop(oldest)
             resample = Image.Resampling.LANCZOS
             self.cache[key] = (
                 self.banner.resize(key, resample), self.empty.resize(key, resample),
@@ -204,9 +215,10 @@ class Artwork:
                 sample = Image.new("RGB", (box[2]-box[0], (box[3]-box[1])*2))
                 sample.paste(full.crop(box), (0, 0))
                 sample.paste(empty.crop(box), (0, box[3]-box[1]))
-                self.palette = sample.quantize(colors=128, dither=Image.Dither.NONE)
+                self.palettes[key] = sample.quantize(colors=128, dither=Image.Dither.NONE)
             else:
-                self.palette = full.quantize(colors=128, dither=Image.Dither.NONE)
+                self.palettes[key] = full.quantize(colors=128, dither=Image.Dither.NONE)
+        self.palette = self.palettes[key]
         return self.cache[key]
 
     def bar(self, width, height, progress, tick, busy):
@@ -258,7 +270,9 @@ class Screen:
         self.motion_key = None
         self.motion_frames = {}
         self.motion_offset = None
+        self.bar_reveal_started = None
         self.work_painted = False
+        self.footer_kind = None
         self.arrow_cache = {}
         self.arrow_location = None
         self.arrow_frame = None
@@ -266,7 +280,7 @@ class Screen:
         self.static = {}
 
     def mark_ready(self):
-        if self.ready_file and not self.gate and self.transition_started is None:
+        if self.ready_file and not self.gate and self.transition_started is None and self.bar_reveal_started is None:
             if not self.ready_file.exists():
                 self.ready_file.touch()
 
@@ -286,6 +300,32 @@ class Screen:
         return (f"{ESC}[{row};1H{ESC}[48;2;{BG[0]};{BG[1]};{BG[2]}m{ESC}[2K"
                 f"{ESC}[{row};{col}H{ESC}[38;2;{color[0]};{color[1]};{color[2]}m{value}{ESC}[0m")
 
+    def percentage(self, row, value, color):
+        if not self.use_sixel:
+            return self.text(row, value, color)
+        clear = self.text(row, "") if self.footer_kind != "percentage" else ""
+        self.footer_kind = "percentage"
+        size = max(8, round(self.ch*.72))
+        key = ("percentage", self.cw, self.ch, value, color)
+        if key not in self.static:
+            font_path = next((p for p in (
+                "/usr/share/fonts/TTF/Hack-Regular.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+                "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+            ) if Path(p).is_file()), None)
+            font = ImageFont.truetype(font_path, size) if font_path else ImageFont.load_default()
+            # SIXEL encodes six-pixel bands. Keep the last band inside this
+            # text row so the next caption cannot erase it after font zoom.
+            frame = Image.new("RGB", (self.cw*8, max(6, self.ch//6*6)), BG)
+            draw = ImageDraw.Draw(frame)
+            box = draw.textbbox((0, 0), value, font=font)
+            draw.text(((frame.width-box[2]+box[0])//2-box[0],
+                       (frame.height-box[3]+box[1])//2-box[1]), value, font=font, fill=color)
+            # Percentages have only 101 values; retain their encoded glyphs.
+            self.static[key] = sixel(frame)
+        col = max(1, (self.cols-8)//2+1)
+        return clear + f"{ESC}[{row};{col}H" + self.static[key]
+
     def image(self, img, row, col, cache_key=None, palette=None):
         if cache_key in self.static:
             encoded = self.static[cache_key]
@@ -299,6 +339,22 @@ class Screen:
             return f"{ESC}[{row};{col}H" + encoded
         return "".join(f"{ESC}[{row+i};{col}H{line}" for i, line in enumerate(encoded))
 
+    def fade_image(self, img, row, col, opacity, cache_key):
+        """Fade cached color definitions; never quantize the bar per frame."""
+        if cache_key not in self.static:
+            self.static[cache_key] = (sixel(img, parts=True) if self.use_sixel else
+                halfblocks(img, max(1, round(img.width/self.cw)), max(1, round(img.height/self.ch))))
+        encoded = self.static[cache_key]
+        def color(match):
+            return match[1] + ";".join(str(round(int(match[i])*opacity)) for i in (2, 3, 4))
+        if self.use_sixel:
+            width, height, definitions, data = encoded
+            definitions = re.sub(r"(#\d+;2;)(\d+);(\d+);(\d+)", color, definitions)
+            return f'{ESC}[{row};{col}H{ESC}P0;1;0q"1;1;{width};{height}' + definitions + data
+        return "".join(f"{ESC}[{row+i};{col}H" +
+            re.sub(r"((?:38|48);2;)(\d+);(\d+);(\d+)", color, line)
+            for i, line in enumerate(encoded))
+
     def accept(self, record):
         fields = record.decode("utf-8", errors="replace").split("\x1f")
         if fields[0] == "stop":
@@ -309,6 +365,7 @@ class Screen:
             if not self.gate:
                 self.layout_key = None
                 self.transition_started = self.motion_started = None
+                self.bar_reveal_started = None
             self.gate, self.mode = True, fields[1]
             self.selection = int(fields[2])
         elif fields[0] == "state" and len(fields) == 5:
@@ -519,6 +576,8 @@ class Screen:
         self.send(canvas)
         if t >= 1:
             self.transition_started = self.motion_started = None
+            self.bar_reveal_started = tick
+            self.work_painted = False
             self.last_signature = None
             return False
         return True
@@ -526,18 +585,28 @@ class Screen:
     def render(self, tick):
         size = os.get_terminal_size(self.fd)
         self.cols, self.rows = max(1, size.columns), max(1, size.lines)
-        key = (self.cols, self.rows)
+        try:
+            _, _, pixel_width, pixel_height = struct.unpack("HHHH",
+                fcntl.ioctl(self.fd, termios.TIOCGWINSZ, b"\0"*8))
+            if pixel_width and pixel_height:
+                self.cw, self.ch = max(1, pixel_width//self.cols), max(1, pixel_height//self.rows)
+        except OSError:
+            pass
+        # Konsole zoom changes cell pixels as well as rows/columns. The kernel
+        # reports both immediately; no terminal query or key-reader wait needed.
+        key = (self.cols, self.rows, self.cw, self.ch)
         redraw = key != self.layout_key
         mode_changed = self.gate != self.last_gate
         signature = (key, self.gate, self.mode, self.selection, self.phase,
                      self.progress, self.detail, self.state, tuple(tuple(log) for log in self.logs))
-        animated = self.gate or self.transition_started is not None or (not self.gate and self.state == "busy" and self.progress != 0)
+        animated = self.gate or self.transition_started is not None or self.bar_reveal_started is not None or (not self.gate and self.state == "busy" and self.progress != 0)
         if signature == self.last_signature and not animated:
             return
         self.last_signature, self.last_gate = signature, self.gate
         if redraw:
             self.layout_key, self.static = key, {}
             self.work_painted = False
+            self.footer_kind = None
             self.motion_offset = None
             self.arrow_location = None
         parts = []
@@ -545,6 +614,7 @@ class Screen:
             parts.append(f"{ESC}[48;2;{BG[0]};{BG[1]};{BG[2]}m{ESC}[2J{ESC}[H")
         if self.rows < 12 or self.cols < 32:
             self.transition_started = self.motion_started = None
+            self.bar_reveal_started = None
             parts += [self.text(1, "ZeroDay", GOLD), self.text(3, self.phase)]
             parts.append(self.text(min(self.rows, 5), self.detail or "Resize the window for artwork", MUTED))
             if self.gate:
@@ -561,10 +631,13 @@ class Screen:
         image_rows = max(1, int(width * 3 / 8) // self.ch)
         height = image_rows * self.ch
         col = max(1, (self.cols - width // self.cw) // 2 + 1)
+        bar_width, bar_height = max(1, round(width*BAR_SCALE)), max(2, round(height*BAR_SCALE))
+        bar_col = max(1, (self.cols - math.ceil(bar_width/self.cw)) // 2 + 1)
+        bar_rows = math.ceil(bar_height/self.ch)
         gate_top = 2
         top = gate_top if self.gate or self.transition_started is not None else gate_top + drop
         if self.art:
-            banner, empty, _, _ = self.art.fit(width, height)
+            banner, _, _, _ = self.art.fit(width, height)
             if self.transition_started is not None:
                 if redraw:
                     self.send("".join(parts))
@@ -591,45 +664,66 @@ class Screen:
             if self.art and "bar" not in self.static:
                 # Prepare the static ornament once, before the user clicks.
                 # Switching screens then needs no full-picture quantization.
-                self.image(empty, label_row + 1, col, "bar")
+                empty = self.art.fit(bar_width, bar_height)[1]
+                self.image(empty, label_row + 1, bar_col, "bar")
         else:
-            parts.append(self.text(label_row, self.phase, GOLD))
+            reveal = 1
+            if self.bar_reveal_started is not None:
+                t = min(1, max(0, (tick-self.bar_reveal_started)/BAR_FADE_SECONDS))
+                reveal = t*t*(3-2*t)
+                if t >= 1:
+                    self.bar_reveal_started = None
+                    self.work_painted = False
+            def ink(rgb):
+                return tuple(round(c*reveal) for c in rgb)
+            parts.append(self.text(label_row, self.phase, ink(GOLD)))
             bar_row = label_row + 1
             busy = self.state == "busy"
             if self.art:
-                if redraw or mode_changed or not self.work_painted:
-                    parts.append(self.image(empty, bar_row, col, "bar"))
-                frame = self.art.bar(width, height, self.progress, tick, busy)
-                # Repaint only the horizontal track, leaving the ornaments and
-                # banner untouched. Align to full cells to avoid SIXEL residue.
-                y1 = int(height * 443 / 768) // self.ch * self.ch
-                y2 = min(height, math.ceil(height * 486 / 768 / self.ch) * self.ch)
-                x1 = int(width * 354 / 2048) // self.cw * self.cw
-                x2 = min(width, math.ceil(width * 1662 / 2048 / self.cw) * self.cw)
-                strip = frame.crop((x1, y1, x2, y2))
-                parts.append(self.image(strip, bar_row + y1 // self.ch, col + x1 // self.cw, palette=self.art.palette))
+                if reveal < 1:
+                    reveal_key = ("bar-reveal", self.progress)
+                    frame = (self.art.bar(bar_width, bar_height, self.progress, tick, False)
+                             if reveal_key not in self.static else None)
+                    parts.append(self.fade_image(frame, bar_row, bar_col, reveal, reveal_key))
+                else:
+                    empty = self.art.fit(bar_width, bar_height)[1]
+                    if redraw or mode_changed or not self.work_painted:
+                        parts.append(self.image(empty, bar_row, bar_col, "bar"))
+                    frame = self.art.bar(bar_width, bar_height, self.progress, tick, busy)
+                    # Repaint only the horizontal track, leaving the ornaments
+                    # and banner untouched. Align to cells to avoid residue.
+                    y1 = int(bar_height * 443 / 768) // self.ch * self.ch
+                    y2 = min(bar_height, math.ceil(bar_height * 486 / 768 / self.ch) * self.ch)
+                    x1 = int(bar_width * 354 / 2048) // self.cw * self.cw
+                    x2 = min(bar_width, math.ceil(bar_width * 1662 / 2048 / self.cw) * self.cw)
+                    strip = frame.crop((x1, y1, x2, y2))
+                    parts.append(self.image(strip, bar_row + y1 // self.ch, bar_col + x1 // self.cw, palette=self.art.palette))
             else:
-                n = max(1, min(54, self.cols - 6))
+                n = max(1, round(min(54, self.cols - 6)*BAR_SCALE))
                 if self.progress < 0:
                     head = int((math.sin(tick * 2) + 1) / 2 * max(0, n - 5))
                     bar = "·" * head + "━━━━━" + "·" * (n - head - 5)
                 else:
                     count = self.progress * n // 1000
                     bar = "━" * count + "·" * (n - count)
-                parts.append(self.text(bar_row + image_rows // 2, bar, GOLD))
-            footer = bar_row + image_rows
+                parts.append(self.text(bar_row + bar_rows // 2, bar, ink(GOLD)))
+            footer = bar_row + bar_rows
             value = "Receiving data" if self.progress < 0 else f"{self.progress // 10}%"
             if self.state == "error":
                 value = "Download failed"
-            parts.append(self.text(footer, value, GOLD))
-            parts.append(self.text(footer + 1, self.detail, MUTED))
+            if self.progress >= 0 and self.state != "error":
+                parts.append(self.percentage(footer, value, ink(GOLD)))
+            else:
+                parts.append(self.text(footer, value, ink(GOLD)))
+                self.footer_kind = "label"
+            parts.append(self.text(footer + 1, self.detail, ink(MUTED)))
             for i in range(2):
                 kind, msg = self.logs[-2:][i] if i < len(self.logs) else ("", "")
                 color = (160, 66, 48) if kind in ("fail", "warn") else MUTED
-                parts.append(self.text(footer + 3 + i, msg, color))
+                parts.append(self.text(footer + 3 + i, msg, ink(color)))
         self.send("".join(parts))
         if not self.gate:
-            self.work_painted = True
+            self.work_painted = self.bar_reveal_started is None
         self.mark_ready()
         if self.gate and self.use_sixel:
             self.prepare_motion(banner)

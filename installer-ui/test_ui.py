@@ -290,6 +290,85 @@ class Render(unittest.TestCase):
             self.assertNotEqual(writes[-1], first)
             self.assertNotIn("\x1b[2J", writes[-1])
 
+    def test_smaller_bar_fades_after_motion_and_ready_waits_for_reveal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ready = Path(tmp)/"ready"
+            screen = renderer.Screen(1, ROOT/"assets", use_sixel=True, ready_file=ready)
+            writes = []
+            screen.send = writes.append
+            with mock.patch.object(renderer.os, "get_terminal_size", return_value=os.terminal_size((80, 30))):
+                screen.render(10)
+                banner_size = renderer.re.search(r'"1;1;(\d+);(\d+)', screen.static["banner"]).groups()
+                bar_size = renderer.re.search(r'"1;1;(\d+);(\d+)', screen.static["bar"]).groups()
+                for full, smaller in zip(banner_size, bar_size):
+                    self.assertEqual(int(smaller), round(int(full)*.8))
+                deadline = time.monotonic()+6
+                while len(screen.motion_frames)<6*renderer.MOTION_STEPS and time.monotonic()<deadline:
+                    time.sleep(.01)
+                with mock.patch.object(renderer.time, "monotonic", return_value=10):
+                    screen.accept(b"state\x1fInstalling\x1f0\x1f\x1fbusy")
+                screen.render(10.9)
+                screen.render(13.2)
+                self.assertIsNone(screen.bar_reveal_started)
+                self.assertNotIn(("bar-reveal", 0), screen.static)
+                self.assertFalse(ready.exists())
+                screen.render(13.4)
+                self.assertEqual(screen.bar_reveal_started, 13.4)
+                black = writes[-1]
+                definitions = renderer.re.findall(r'#\d+;2;(\d+);(\d+);(\d+)', black)
+                self.assertTrue(definitions)
+                self.assertTrue(all(set(rgb)=={"0"} for rgb in definitions))
+                self.assertFalse(ready.exists())
+                with mock.patch.object(renderer, "sixel", side_effect=AssertionError("fade re-encoded its pixels")):
+                    # A new percentage color may encode a tiny glyph; the bar
+                    # must retain its cached pixel body during the fade.
+                    with mock.patch.object(screen, "percentage", return_value=""):
+                        screen.render(13.725)
+                midpoint = writes[-1]
+                self.assertNotEqual(midpoint, black)
+                body = screen.static[("bar-reveal", 0)][3]
+                self.assertIn(body, black)
+                self.assertIn(body, midpoint)
+                self.assertFalse(ready.exists())
+                screen.render(14.1)
+                self.assertIsNone(screen.bar_reveal_started)
+                self.assertTrue(ready.exists())
+
+    def test_cell_pixels_refresh_layout_after_zoom_even_with_same_row_count(self):
+        master, slave = pty.openpty()
+        try:
+            screen = renderer.Screen(slave, ROOT/"assets", use_sixel=True)
+            writes = []
+            screen.send = writes.append
+            fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 80, 720, 540))
+            screen.render(10)
+            first = screen.static["banner"]
+            fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 80, 1050, 798))
+            screen.render(10.1)
+            self.assertEqual((screen.cw, screen.ch), (13, 26))
+            self.assertNotEqual(screen.static["banner"], first)
+            self.assertIn("\x1b[2J", writes[-1])
+        finally:
+            os.close(master)
+            os.close(slave)
+
+    def test_percentage_uses_small_glyph_canvas_and_clears_previous_digits(self):
+        screen = renderer.Screen(1, ROOT/"assets", use_sixel=True)
+        screen.cols, screen.rows = 110, 36
+        first = screen.percentage(20, "9%", renderer.GOLD)
+        second = screen.percentage(20, "100%", renderer.GOLD)
+        self.assertIn("\x1b[2K", first)
+        self.assertNotIn("\x1b[2K", second)
+        self.assertNotEqual(first, second)
+        sizes = [renderer.re.search(r'"1;1;(\d+);(\d+)', s).groups() for s in (first,second)]
+        self.assertEqual(sizes[0], sizes[1])
+        self.assertEqual(int(sizes[0][1]), screen.ch)
+        screen.ch = 19
+        zoomed = screen.percentage(20, "100%", renderer.GOLD)
+        height = int(renderer.re.search(r'"1;1;\d+;(\d+)', zoomed)[1])
+        self.assertLessEqual(height, screen.ch)
+        self.assertEqual(height%6, 0)
+
     def test_sound_names_match_actions_without_repeating_for_progress(self):
         screen = renderer.Screen(1, ROOT/"assets")
         screen.sounds = mock.Mock()
