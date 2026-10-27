@@ -24,6 +24,7 @@ import sys
 import threading
 import termios
 import time
+import wave
 
 try:
     from PIL import Image, ImageDraw, ImageFont
@@ -40,56 +41,123 @@ MOTION_STEPS = 4  # Quarter-pixel coverage keeps a slow descent from stepping.
 FRAME_PERIOD = 1 / 60
 BAR_SCALE = 0.8
 BAR_FADE_SECONDS = 0.65
+TEXT_FADE_SECONDS = 0.4
 
 
 class Sounds:
-    """Optional, nonblocking cues; never put audio on the animation path."""
+    """Preloaded cues on one warm, paced PCM stream; play() never does I/O."""
     def __init__(self, directory):
-        self.directory, self.child = directory, None
-        self.retired = []
-        self.command = None
+        self.child = None
+        self.clips = {}
+        self.lock = threading.Lock()
+        self.stopped = threading.Event()
+        self.drained = threading.Event()
+        self.drained.set()
+        self.current, self.offset = b"", 0
+        self.thread = None
         if os.environ.get("ZERODAY_UI_SOUND", "1") == "0":
             return
+        for name in ("move", "confirm", "cancel"):
+            try:
+                with wave.open(str(directory / f"{name}.wav"), "rb") as source:
+                    if (source.getnchannels(), source.getsampwidth(), source.getframerate(), source.getcomptype()) == (2, 2, 48000, "NONE"):
+                        self.clips[name] = source.readframes(source.getnframes())
+            except (OSError, EOFError, wave.Error):
+                pass
+        self.commands = []
         for name, args in (
-            ("pw-play", ["--volume", "0.45"]),
-            ("paplay", ["--volume=29491"]),
-            ("ffplay", ["-nodisp", "-autoexit", "-loglevel", "quiet", "-volume", "45"]),
+            ("pw-play", ["--raw", "--format", "s16", "--rate", "48000", "--channels", "2", "--latency", "30ms", "--volume", "0.45", "-"]),
+            ("paplay", ["--raw", "--format=s16le", "--rate=48000", "--channels=2", "--latency-msec=30", "--volume=29491"]),
+            ("ffplay", ["-nodisp", "-autoexit", "-loglevel", "quiet", "-f", "s16le", "-ar", "48000", "-ch_layout", "stereo", "-volume", "45", "-i", "pipe:0"]),
         ):
             if player := shutil.which(name):
-                self.command = [player, *args]
-                break
+                self.commands.append([player, *args])
+        if self.commands and self.clips:
+            self.thread = threading.Thread(target=self.pump, daemon=True, name="ui-audio")
+            self.thread.start()
 
     def play(self, name):
-        if name not in ("move", "confirm", "cancel") or not self.command:
+        if name not in self.clips or not self.thread or not self.thread.is_alive():
             return
-        path = self.directory / f"{name}.wav"
-        if not path.is_file():
-            return
-        if self.child and self.child.poll() is None:
-            self.child.terminate()
-            self.retired.append(self.child)
-        self.retired = [p for p in self.retired if p.poll() is None]
-        try:
-            self.child = subprocess.Popen([*self.command, str(path)],
-                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except OSError:
-            self.child = None
+        with self.lock:
+            self.current, self.offset = self.clips[name], 0
+            self.drained.clear()
+
+    def pump(self):
+        # Feed 20 ms at a time, including silence while awaiting the first
+        # choice. Sending silence without pacing would queue dead time ahead
+        # of the cue. A single stream also avoids reconnecting for every key.
+        chunk_size, period = 3840, 0.02
+        silence = bytes(chunk_size)
+        for command in self.commands:
+            if self.stopped.is_set():
+                break
+            try:
+                self.child = subprocess.Popen(command, stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, bufsize=0)
+                os.set_blocking(self.child.stdin.fileno(), False)
+                deadline = time.monotonic()
+                while not self.stopped.is_set():
+                    with self.lock:
+                        clip, offset = self.current, self.offset
+                        chunk = clip[offset:offset+chunk_size].ljust(chunk_size, b"\0") if clip else silence
+                    remaining = memoryview(chunk)
+                    while remaining and not self.stopped.is_set():
+                        if self.child.poll() is not None:
+                            raise BrokenPipeError
+                        if select.select([], [self.child.stdin], [], .05)[1]:
+                            try:
+                                remaining = remaining[os.write(self.child.stdin.fileno(), remaining):]
+                            except BlockingIOError:
+                                continue
+                    with self.lock:
+                        if self.current is clip and self.offset == offset:
+                            self.offset += chunk_size
+                            if self.offset >= len(clip):
+                                self.current, self.offset = b"", 0
+                                self.drained.set()
+                    deadline = max(deadline+period, time.monotonic())
+                    self.stopped.wait(max(0, deadline-time.monotonic()))
+            except (OSError, ValueError):
+                pass
+            finally:
+                if self.child:
+                    self.child.stdin.close()
+                    try:
+                        self.child.wait(timeout=.2)
+                    except subprocess.TimeoutExpired:
+                        self.child.kill()
+                        self.child.wait()
+        self.drained.set()
 
     def close(self):
-        if self.child:
-            try:
-                self.child.wait(timeout=1.3)
-            except subprocess.TimeoutExpired:
-                self.child.terminate()
-                try:
-                    self.child.wait(timeout=.2)
-                except subprocess.TimeoutExpired:
-                    self.child.kill()
-                    self.child.wait()
-        for child in self.retired:
-            if child.poll() is None:
-                child.kill()
-            child.wait()
+        if self.thread:
+            self.drained.wait(1.3)
+            self.stopped.set()
+            self.thread.join(timeout=.5)
+
+
+def probe_terminal(fd, timeout=.25):
+    """Read capability replies without consuming keys typed during startup."""
+    os.write(fd, b"\x1b[c\x1b[16t\x1b]11;?\x07")
+    data = b""
+    deadline = time.monotonic()+timeout
+    while time.monotonic() < deadline:
+        if select.select([fd], [], [], max(0, deadline-time.monotonic()))[0]:
+            block = os.read(fd, 4096)
+            if not block:
+                break
+            data += block
+    da = re.search(rb"\x1b\[\?([0-9;]*)c", data)
+    cell = re.search(rb"\x1b\[6;([0-9]+);([0-9]+)t", data)
+    background = re.search(rb"\x1b\]11;(rgb:[0-9a-fA-F]+/[0-9a-fA-F]+/[0-9a-fA-F]+)(?:\x07|\x1b\\)", data)
+    pending = data
+    for match in (da, cell, background):
+        if match:
+            pending = pending.replace(match[0], b"", 1)
+    cw, ch = (int(cell[2]), int(cell[1])) if cell else (9, 18)
+    sixel_enabled = bool(da and b"4" in da[1].split(b";") and cell)
+    return cw, ch, sixel_enabled, background[1].decode() if background else "", pending
 
 
 def clean(text):
@@ -256,8 +324,8 @@ class Screen:
     def __init__(self, fd, assets, cell_width=9, cell_height=18, use_sixel=False, ready_file=None):
         self.fd, self.cw, self.ch = fd, cell_width, cell_height
         self.use_sixel = use_sixel and Image is not None
-        self.art = Artwork(assets) if Image else None
         self.sounds = Sounds(assets / "sounds")
+        self.art = Artwork(assets) if Image else None
         self.gate = True
         self.mode, self.selection = "install", 0
         self.phase, self.progress, self.detail, self.state = "Ready to install", 0, "", "busy"
@@ -278,11 +346,37 @@ class Screen:
         self.arrow_frame = None
         self.ready_file = ready_file
         self.static = {}
+        self.caption_state = {}
+        self.caption_fades = {}
 
     def mark_ready(self):
-        if self.ready_file and not self.gate and self.transition_started is None and self.bar_reveal_started is None:
-            if not self.ready_file.exists():
-                self.ready_file.touch()
+        if self.ready_file:
+            target = self.ready_file.with_name("gate-ready") if self.gate else self.ready_file
+            if self.gate or (self.transition_started is None and self.bar_reveal_started is None):
+                if not target.exists():
+                    target.touch()
+
+    def prepare_captions(self, tick):
+        values = {"phase": self.phase, "detail": self.detail,
+                  **{f"log{i}": log[1] for i, log in enumerate(self.logs[-2:])}}
+        for key in ("phase", "detail", "log0", "log1"):
+            value = values.get(key, "")
+            previous = self.caption_state.get(key, "")
+            # Numerical detail updates keep their current fade instead of
+            # repeatedly vanishing. A newly named phase or log gets one fade.
+            new = value and (not previous or (key != "detail" and previous != value))
+            if new and self.bar_reveal_started is None and self.last_gate is False:
+                self.caption_fades[key] = tick
+            self.caption_state[key] = value
+            if not value or tick-self.caption_fades.get(key, tick) >= TEXT_FADE_SECONDS:
+                self.caption_fades.pop(key, None)
+
+    def caption_ink(self, key, color, tick, reveal):
+        start = self.caption_fades.get(key)
+        if start is not None:
+            t = min(1, max(0, (tick-start)/TEXT_FADE_SECONDS))
+            reveal *= t*t*(3-2*t)
+        return tuple(round(c*reveal) for c in color)
 
     def send(self, value):
         # Synchronized updates prevent a terminal painting half a moving image
@@ -366,6 +460,8 @@ class Screen:
                 self.layout_key = None
                 self.transition_started = self.motion_started = None
                 self.bar_reveal_started = None
+                self.caption_state.clear()
+                self.caption_fades.clear()
             self.gate, self.mode = True, fields[1]
             self.selection = int(fields[2])
         elif fields[0] == "state" and len(fields) == 5:
@@ -599,7 +695,10 @@ class Screen:
         mode_changed = self.gate != self.last_gate
         signature = (key, self.gate, self.mode, self.selection, self.phase,
                      self.progress, self.detail, self.state, tuple(tuple(log) for log in self.logs))
-        animated = self.gate or self.transition_started is not None or self.bar_reveal_started is not None or (not self.gate and self.state == "busy" and self.progress != 0)
+        captions_were_fading = bool(self.caption_fades)
+        if not self.gate and self.transition_started is None:
+            self.prepare_captions(tick)
+        animated = self.gate or self.transition_started is not None or self.bar_reveal_started is not None or self.caption_fades or captions_were_fading or (not self.gate and self.state == "busy" and self.progress != 0)
         if signature == self.last_signature and not animated:
             return
         self.last_signature, self.last_gate = signature, self.gate
@@ -676,7 +775,7 @@ class Screen:
                     self.work_painted = False
             def ink(rgb):
                 return tuple(round(c*reveal) for c in rgb)
-            parts.append(self.text(label_row, self.phase, ink(GOLD)))
+            parts.append(self.text(label_row, self.phase, self.caption_ink("phase", GOLD, tick, reveal)))
             bar_row = label_row + 1
             busy = self.state == "busy"
             if self.art:
@@ -716,11 +815,11 @@ class Screen:
             else:
                 parts.append(self.text(footer, value, ink(GOLD)))
                 self.footer_kind = "label"
-            parts.append(self.text(footer + 1, self.detail, ink(MUTED)))
+            parts.append(self.text(footer + 1, self.detail, self.caption_ink("detail", MUTED, tick, reveal)))
             for i in range(2):
                 kind, msg = self.logs[-2:][i] if i < len(self.logs) else ("", "")
                 color = (160, 66, 48) if kind in ("fail", "warn") else MUTED
-                parts.append(self.text(footer + 3 + i, msg, ink(color)))
+                parts.append(self.text(footer + 3 + i, msg, self.caption_ink(f"log{i}", color, tick, reveal)))
         self.send("".join(parts))
         if not self.gate:
             self.work_painted = self.bar_reveal_started is None
@@ -737,7 +836,13 @@ def main():
     parser.add_argument("--cell-height", type=int, default=18)
     parser.add_argument("--sixel", action="store_true")
     parser.add_argument("--ready-file", type=Path)
+    parser.add_argument("--probe", type=int, metavar="TTY_FD")
     args = parser.parse_args()
+    if args.probe is not None:
+        cw, ch, graphics, background, pending = probe_terminal(args.probe)
+        print("\x1f".join((str(cw), str(ch), str(int(graphics)), background,
+              "".join(f"\\x{byte:02x}" for byte in pending))))
+        return
     screen = Screen(args.fd, args.assets, max(1, args.cell_width), max(1, args.cell_height), args.sixel, args.ready_file)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     signal.signal(signal.SIGINT, lambda *_: sys.exit(0))

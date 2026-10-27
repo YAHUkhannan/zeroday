@@ -10,6 +10,7 @@ import select
 import signal
 import struct
 import subprocess
+import sys
 import tempfile
 import termios
 import threading
@@ -133,7 +134,7 @@ ui_fetch "$2" "$3" 0 1000
         screen.accept(b"download\x1ffile\x1f100\x1f100\x1fdone")
         self.assertEqual(screen.progress, 1000)
 
-    def terminal_preview(self, cancel=False, sixel=False):
+    def terminal_preview(self, cancel=False, sixel=False, early_enter=False):
         with tempfile.TemporaryDirectory() as tmp:
             master, slave = pty.openpty()
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 36, 110, 990, 648))
@@ -157,6 +158,12 @@ ui_fetch "$2" "$3" 0 1000
                         block = os.read(master, 1048576)
                         data.extend(block)
                         if b"\x1b[c" in block:
+                            if early_enter and not entered:
+                                # A user can press Enter while the terminal is
+                                # answering DA, before the menu has painted.
+                                os.write(master, b"\r")
+                                entered = True
+                                entered_at = time.monotonic()
                             os.write(master, b"\x1b[?62;4;22c" if sixel else b"\x1b[?1;2c")
                         if b"\x1b[16t" in block:
                             os.write(master, b"\x1b[6;18;9t")
@@ -198,6 +205,11 @@ ui_fetch "$2" "$3" 0 1000
 
     def test_sixel_terminal_negotiation_and_cleanup(self):
         self.terminal_preview(sixel=True)
+
+    def test_single_enter_during_startup_is_preserved(self):
+        data = self.terminal_preview(early_enter=True)
+        self.assertIn(b"INSTALLER PREVIEW", data)
+        self.assertIn(b"Preview complete", data)
 
     def test_cancellation_restores_terminal_and_removes_download(self):
         self.terminal_preview(cancel=True)
@@ -381,6 +393,92 @@ class Render(unittest.TestCase):
         screen.accept(b"sound\x1fcancel")
         self.assertEqual(screen.sounds.play.call_args_list,
                          [mock.call("move"),mock.call("move"),mock.call("confirm"),mock.call("cancel")])
+
+    def test_first_sound_uses_warm_stream_and_reuses_player(self):
+        # Capture the actual PCM pipe in a subprocess without emitting sound.
+        # Verify a cold first click reaches it promptly and later clicks use
+        # the same process; this is not a claim about hardware output latency.
+        with tempfile.TemporaryDirectory() as tmp:
+            raw, onset = Path(tmp)/"raw", Path(tmp)/"onset"
+            helper = '''import os, sys, time
+from pathlib import Path
+with open(sys.argv[1], "wb", buffering=0) as output:
+    while True:
+        block = os.read(0, 3840)
+        if not block: break
+        output.write(block)
+        if any(block) and not Path(sys.argv[2]).exists():
+            Path(sys.argv[2]).write_text(str(time.monotonic()))
+'''
+            real_popen = subprocess.Popen
+            def capture_player(*args, **kwargs):
+                return real_popen([sys.executable, "-c", helper, str(raw), str(onset)], **kwargs)
+            with mock.patch.dict(os.environ, {"ZERODAY_UI_SOUND": "1"}), \
+                 mock.patch.object(renderer.shutil, "which", side_effect=lambda name: "/test/pw-play" if name == "pw-play" else None), \
+                 mock.patch.object(renderer.subprocess, "Popen", side_effect=capture_player) as launch:
+                sounds = renderer.Sounds(ROOT/"assets/sounds")
+                try:
+                    deadline = time.monotonic()+2
+                    while (not raw.exists() or raw.stat().st_size < 7680) and time.monotonic()<deadline:
+                        time.sleep(.005)
+                    self.assertTrue(raw.exists())
+                    self.assertFalse(any(raw.read_bytes()))
+                    pressed = time.monotonic()
+                    sounds.play("confirm")
+                    deadline = pressed+1
+                    while not onset.exists() and time.monotonic()<deadline:
+                        time.sleep(.005)
+                    self.assertTrue(onset.exists(), "first confirmation never reached the audio stream")
+                    self.assertLess(float(onset.read_text())-pressed, .2)
+                    sounds.play("move")
+                    time.sleep(.04)
+                    sounds.play("cancel")
+                finally:
+                    sounds.close()
+                self.assertEqual(launch.call_count, 1)
+                self.assertFalse(sounds.thread.is_alive())
+                self.assertIsNotNone(sounds.child.poll())
+
+    def test_startup_probe_keeps_interleaved_enter_and_arrows(self):
+        master, slave = pty.openpty()
+        try:
+            attrs = termios.tcgetattr(slave)
+            attrs[3] &= ~(termios.ECHO | termios.ICANON)
+            termios.tcsetattr(slave, termios.TCSANOW, attrs)
+            def answer():
+                os.read(master, 1024)
+                os.write(master, b"\n\x1b[?62;4;22c\x1b[C\x1b[6;18;9t\x1b]11;rgb:2323/2626/2727\x1b\\")
+            thread = threading.Thread(target=answer)
+            thread.start()
+            result = renderer.probe_terminal(slave)
+            thread.join(1)
+            self.assertEqual(result, (9, 18, True, "rgb:2323/2626/2727", b"\n\x1b[C"))
+        finally:
+            os.close(master)
+            os.close(slave)
+
+    def test_late_captions_fade_without_restarting_on_rate_updates(self):
+        screen = renderer.Screen(1, ROOT/"assets")
+        writes = []
+        screen.send = writes.append
+        with mock.patch.object(renderer.os, "get_terminal_size", return_value=os.terminal_size((80, 30))):
+            screen.accept(b"state\x1fReady\x1f0\x1f\x1fdone")
+            screen.render(10)
+            screen.accept(b"state\x1fDownloading\x1f0\x1f1 KiB/s\x1fdone")
+            screen.accept(b"log\x1finfo\x1fNew message")
+            screen.render(11)
+            self.assertEqual(screen.caption_ink("phase", renderer.GOLD, 11, 1), (0, 0, 0))
+            screen.render(11.2)
+            mid = screen.caption_ink("detail", renderer.MUTED, 11.2, 1)
+            self.assertTrue(all(0<c<68 for c in mid))
+            screen.accept(b"state\x1fDownloading\x1f0\x1f2 KiB/s\x1fdone")
+            screen.render(11.25)
+            self.assertEqual(screen.caption_fades["detail"], 11)
+            screen.render(11.5)
+            self.assertEqual(screen.caption_ink("log0", renderer.MUTED, 11.5, 1), renderer.MUTED)
+            count = len(writes)
+            screen.render(12)
+            self.assertEqual(len(writes), count, "finished fade kept redrawing an idle screen")
 
     def test_install_fades_words_then_moves_banner_down_without_resizing(self):
         screen = renderer.Screen(1, ROOT/"assets")

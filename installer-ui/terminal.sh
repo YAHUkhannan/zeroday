@@ -17,6 +17,7 @@ UI_MODE="install"
 UI_KEY=""
 UI_SAVED_STTY=""
 UI_BACKGROUND_OLD=""
+UI_PENDING_INPUT=""
 c_reset=""; c_ok=""; c_warn=""; c_err=""; c_dim=""
 
 # stdin may be a pipe containing the script; only /dev/tty supplies input.
@@ -44,7 +45,7 @@ ui_send() {
 ui_start() {
 	[ "$INTERACTIVE" -eq 1 ] || return 0
 	[ -z "$UI_PID" ] || return 0
-	local da="" cell="" background="" cw=9 ch=18
+	local report="" background="" pending="" graphics_enabled=0 cw=9 ch=18
 	local -a graphics=()
 	if [ -z "$UI_TMP" ]; then
 		UI_TMP=$(mktemp -d "${TMPDIR:-/tmp}/zeroday-ui.XXXXXXXX")
@@ -54,25 +55,21 @@ ui_start() {
 	stty -echo -icanon min 1 time 0 <&3 2>/dev/null || true
 	# Query rather than guessing from TERM. Unsupported terminals use truecolor
 	# half-block art, and systems without Pillow still get a working text bar.
-	ui '\033[c'
-	IFS= read -rs -t 0.25 -d c da <&3 || true
-	if [[ "${da};" == *';4;'* ]]; then
-		ui '\033[16t'
-		IFS= read -rs -t 0.25 -d t cell <&3 || true
-		if [[ "$cell" =~ 6\;([0-9]+)\;([0-9]+) ]]; then
-			ch=${BASH_REMATCH[1]}; cw=${BASH_REMATCH[2]}
-			graphics=(--sixel)
-		fi
-	fi
+	# Preserve keys interleaved with terminal reports. The old read-until-c/t
+	# queries swallowed an early Enter along with the response.
+	report=$(python3 "$UI_TMP/renderer.py" --probe "$UI_FD")
+	IFS=$'\037' read -r cw ch graphics_enabled background pending <<< "$report"
+	[[ "$cw" =~ ^[1-9][0-9]*$ ]] || cw=9
+	[[ "$ch" =~ ^[1-9][0-9]*$ ]] || ch=18
+	[ "$graphics_enabled" != 1 ] || graphics=(--sixel)
+	printf -v UI_PENDING_INPUT '%b' "$pending"
 	# Konsole reserves a background cell beyond a SIXEL's right edge. Match
 	# that cell to the canvas, preserving the exact previous terminal color.
-	ui '\033]11;?\a'
-	IFS= read -rs -t 0.2 -d $'\a' background <&3 || true
-	if [[ "$background" =~ (rgb:[0-9a-fA-F]+/[0-9a-fA-F]+/[0-9a-fA-F]+) ]]; then
+	if [[ "$background" =~ ^(rgb:[0-9a-fA-F]+/[0-9a-fA-F]+/[0-9a-fA-F]+)$ ]]; then
 		UI_BACKGROUND_OLD=${BASH_REMATCH[1]}
 		ui '\033]11;#000000\a'
 	fi
-	rm -f "$UI_TMP/events" "$UI_TMP/screen-ready"
+	rm -f "$UI_TMP/events" "$UI_TMP/screen-ready" "$UI_TMP/gate-ready"
 	mkfifo -m 600 "$UI_TMP/events"
 	python3 "$UI_TMP/renderer.py" --fd "$UI_FD" --assets "$UI_TMP/assets" --ready-file "$UI_TMP/screen-ready" --cell-width "$cw" --cell-height "$ch" "${graphics[@]}" < "$UI_TMP/events" 2>"$UI_TMP/renderer.log" &
 	UI_PID=$!
@@ -127,16 +124,28 @@ ui_push() {
 
 ui_frames_build() { :; }
 
+ui_read_char() {
+	if [ -n "$UI_PENDING_INPUT" ]; then
+		UI_CHAR=${UI_PENDING_INPUT:0:1}
+		UI_PENDING_INPUT=${UI_PENDING_INPUT:1}
+		return 0
+	fi
+	IFS= read -rsN1 -t "$1" -u "$UI_FD" UI_CHAR
+}
+
 ui_key() {
 	local key="" rest="" status
 	while true; do
-		if IFS= read -rsN1 -t 0.2 -u "$UI_FD" key; then break; else status=$?; fi
+		if ui_read_char 0.2; then key=$UI_CHAR; break; else status=$?; fi
 		# Timeouts leave room for signal traps. EOF closes the preview.
 		if [ "$status" -le 128 ]; then UI_KEY=q; return 0; fi
 	done
 	case "$key" in
 		$'\r'|$'\n') UI_KEY=$'\025' ;;
-		$'\033') IFS= read -rsN2 -t 0.05 -u "$UI_FD" rest || true; UI_KEY=$rest ;;
+		$'\033')
+			if ui_read_char 0.05; then rest=$UI_CHAR; fi
+			if ui_read_char 0.05; then rest+=$UI_CHAR; fi
+			UI_KEY=$rest ;;
 		*) UI_KEY=$key ;;
 	esac
 }
@@ -146,8 +155,14 @@ ui_arm() {
 	[ "$INTERACTIVE" -eq 1 ] || return 0
 	ui_start
 	local key selection=0
-	rm -f "$UI_TMP/screen-ready"
+	rm -f "$UI_TMP/screen-ready" "$UI_TMP/gate-ready"
 	ui_send gate "$UI_MODE" "$selection"
+	# A queued first Enter must follow the opening paint, so it still gets
+	# the confirmation cue and full transition instead of skipping the menu.
+	while [ ! -f "$UI_TMP/gate-ready" ]; do
+		kill -0 "$UI_PID" 2>/dev/null || return 1
+		sleep 0.01
+	done
 	while true; do
 		ui_key
 		key=$UI_KEY
@@ -158,6 +173,7 @@ ui_arm() {
 			q|Q) ui_send sound cancel; return 1 ;;
 			$' '|$'\025')
 				if [ "$selection" -ne 0 ]; then ui_send sound cancel; return 1; fi
+				rm -f "$UI_TMP/screen-ready"
 				UI_LIVE=1; UI_PCT=0; UI_PHASE="Getting ready"
 				ui_draw_progress
 				# Finish the visual transition before a password prompt or another
