@@ -33,6 +33,8 @@ GOLD = (192, 142, 72)  # Original reference pixel (800, 450), not a replacement 
 MUTED = (68, 68, 68)
 TRACK = (36, 32, 26)
 ESC = "\x1b"
+MOTION_STEPS = 4  # Quarter-pixel coverage keeps a slow descent from stepping.
+FRAME_PERIOD = 1 / 60
 
 
 class Sounds:
@@ -366,15 +368,24 @@ class Screen:
             palette = (q.getpalette() + [0] * 768)[:768]
             palette[127*3:128*3] = BG
             q.putpalette(palette)
-            for offset in range(6):
-                if self.motion_key != key:
-                    return
-                canvas = Image.new("P", (q.width, math.ceil((q.height + 6) / 6) * 6), 127)
-                canvas.putpalette(palette)
-                canvas.paste(q, (0, offset))
-                encoded = sixel(canvas, parts=True)
-                if self.motion_key == key:
-                    self.motion_frames[offset] = encoded
+            size = (q.width, math.ceil((q.height + 6) / 6) * 6)
+            base = Image.new("RGB", size, BG)
+            base.paste(banner, (0, 0))
+            below = Image.new("RGB", size, BG)
+            below.paste(banner, (0, 1))
+            for fraction in range(MOTION_STEPS):
+                # Blend pixel coverage, never resize or re-decode the artwork.
+                layer = Image.blend(base, below, fraction / MOTION_STEPS)
+                layer = layer.quantize(palette=q, dither=Image.Dither.NONE)
+                for offset in range(6):
+                    if self.motion_key != key:
+                        return
+                    canvas = Image.new("P", size, 127)
+                    canvas.putpalette(palette)
+                    canvas.paste(layer, (0, offset))
+                    encoded = sixel(canvas, parts=True)
+                    if self.motion_key == key:
+                        self.motion_frames[offset*MOTION_STEPS + fraction] = encoded
         threading.Thread(target=build, daemon=True, name="banner-frames").start()
 
     def button_layout(self):
@@ -467,7 +478,7 @@ class Screen:
             fade = t*t*(3-2*t)
             self.send(self.gate_words(label_row, fade) + self.arrow(label_row, tick, fade))
             return True
-        if self.use_sixel and len(self.motion_frames) < 6:
+        if self.use_sixel and len(self.motion_frames) < 6*MOTION_STEPS:
             self.send(self.gate_words(label_row, 1))
             return True
         if self.motion_started is None:
@@ -475,14 +486,15 @@ class Screen:
             self.send(self.gate_words(label_row, 1) + self.arrow(label_row, tick, 1))
         t = min(1, (tick - self.motion_started) / 2.4)
         distance = drop * self.ch
-        offset = round(distance * t*t*(3-2*t))
+        offset = round(distance * t*t*(3-2*t) * MOTION_STEPS)
         if self.motion_offset == offset and t < 1:
             return True
         self.motion_offset = offset
         canvas = ""
+        whole, fraction = divmod(offset, MOTION_STEPS)
         if self.use_sixel:
-            w, h, definitions, data = self.motion_frames[offset % 6]
-            bands = offset // 6
+            w, h, definitions, data = self.motion_frames[(whole % 6)*MOTION_STEPS + fraction]
+            bands = whole // 6
             full_height = math.ceil((banner.height + distance + 6) / 6) * 6
             blank = (f"#128!{w}~$-") * bands
             tail = (f"-#128!{w}~$") * ((full_height - h) // 6 - bands)
@@ -494,12 +506,16 @@ class Screen:
             # Half-block terminals use the same pixel movement sampled into
             # their cells, without switching image formats mid-transition.
             layer = Image.new("RGB", (banner.width, banner.height+distance), BG)
-            layer.paste(banner, (0, offset))
+            layer.paste(banner, (0, whole))
+            if fraction:
+                below = Image.new("RGB", layer.size, BG)
+                below.paste(banner, (0, whole+1))
+                layer = Image.blend(layer, below, fraction/MOTION_STEPS)
             canvas += self.image(layer, top, col)
         else:
             for row in range(top, top + drop + 4):
                 canvas += self.text(row, "")
-            canvas += self.text(top + offset // self.ch + 2, "Z E R O D A Y", GOLD)
+            canvas += self.text(top + whole // self.ch + 2, "Z E R O D A Y", GOLD)
         self.send(canvas)
         if t >= 1:
             self.transition_started = self.motion_started = None
@@ -635,8 +651,9 @@ def main():
     screen.send(f"{ESC}[?1049h{ESC}[?25l{ESC}[?7l")
     try:
         running = True
+        next_frame = time.monotonic()
         while running:
-            ready, _, _ = select.select([0], [], [], 1/60)
+            ready, _, _ = select.select([0], [], [], max(0, next_frame-time.monotonic()))
             if ready:
                 data = os.read(0, 65536)
                 if not data:
@@ -646,8 +663,12 @@ def main():
                     record, buffer = buffer.split(b"\x1e", 1)
                     if record and not screen.accept(record):
                         running = False
-            if running:
-                screen.render(time.monotonic())
+            now = time.monotonic()
+            if running and now >= next_frame:
+                screen.render(now)
+                # Rendering and terminal writes consume part of the frame
+                # budget. Do not add another full sleep after that work.
+                next_frame = max(next_frame + FRAME_PERIOD, time.monotonic())
     finally:
         screen.send(f"{ESC}[0m{ESC}[?7h{ESC}[?25h{ESC}[?1049l")
         screen.sounds.close()

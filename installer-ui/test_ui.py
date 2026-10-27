@@ -251,9 +251,9 @@ class Render(unittest.TestCase):
         with mock.patch.object(renderer.os, "get_terminal_size", return_value=os.terminal_size((80, 30))):
             screen.render(10)
             deadline = time.monotonic()+6
-            while len(screen.motion_frames)<6 and time.monotonic()<deadline:
+            while len(screen.motion_frames)<6*renderer.MOTION_STEPS and time.monotonic()<deadline:
                 time.sleep(.01)
-            self.assertEqual(len(screen.motion_frames), 6)
+            self.assertEqual(len(screen.motion_frames), 6*renderer.MOTION_STEPS)
             with mock.patch.object(renderer.time, "monotonic", return_value=10):
                 screen.accept(b"state\x1fInstalling\x1f0\x1f\x1fbusy")
             screen.render(10.9)
@@ -269,6 +269,26 @@ class Render(unittest.TestCase):
             self.assertGreater(len(sizes), 2)
             self.assertEqual(len(set(sizes)), 1)
             self.assertEqual(len(set(anchors)), 1)
+
+    def test_slow_motion_changes_coverage_between_whole_pixel_positions(self):
+        screen = renderer.Screen(1, ROOT/"assets", use_sixel=True)
+        writes = []
+        screen.send = writes.append
+        with mock.patch.object(renderer.os, "get_terminal_size", return_value=os.terminal_size((80, 30))):
+            screen.render(10)
+            deadline = time.monotonic()+6
+            while len(screen.motion_frames)<6*renderer.MOTION_STEPS and time.monotonic()<deadline:
+                time.sleep(.01)
+            self.assertEqual(len(screen.motion_frames), 6*renderer.MOTION_STEPS)
+            with mock.patch.object(renderer.time, "monotonic", return_value=10):
+                screen.accept(b"state\x1fInstalling\x1f0\x1f\x1fbusy")
+            screen.render(10.9)
+            screen.render(11.7)
+            first, position = writes[-1], screen.motion_offset
+            screen.render(11.708)
+            self.assertEqual(position//renderer.MOTION_STEPS, screen.motion_offset//renderer.MOTION_STEPS)
+            self.assertNotEqual(writes[-1], first)
+            self.assertNotIn("\x1b[2J", writes[-1])
 
     def test_sound_names_match_actions_without_repeating_for_progress(self):
         screen = renderer.Screen(1, ROOT/"assets")
