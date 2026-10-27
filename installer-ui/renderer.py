@@ -42,7 +42,7 @@ TRACK = (36, 32, 26)
 ESC = "\x1b"
 MOTION_STEPS = 4  # Quarter-pixel coverage keeps a slow descent from stepping.
 FRAME_PERIOD = 1 / 60
-BAR_SCALE = 0.8
+BAR_HEIGHT_SCALE = 0.8
 BAR_FADE_SECONDS = 0.65
 TEXT_FADE_SECONDS = 0.4
 INTRO_FADE_SECONDS = 1.2
@@ -441,8 +441,8 @@ class Screen:
             frame = Image.new("RGB", (self.cw*8, max(6, self.ch//6*6)), BG)
             draw = ImageDraw.Draw(frame)
             box = draw.textbbox((0, 0), value, font=font)
-            draw.text(((frame.width-box[2]+box[0])//2-box[0],
-                       (frame.height-box[3]+box[1])//2-box[1]), value, font=font, fill=color)
+            draw.text(((frame.width-box[2]+box[0])//2-box[0], -box[1]),
+                      value, font=font, fill=color)
             # Percentages have only 101 values; retain their encoded glyphs.
             self.static[key] = sixel(frame)
         col = max(1, (self.cols-8)//2+1)
@@ -926,7 +926,7 @@ class Screen:
         image_rows = max(1, int(width * 3 / 8) // self.ch)
         height = image_rows * self.ch
         col = max(1, (self.cols - width // self.cw) // 2 + 1)
-        bar_width, bar_height = max(1, round(width*BAR_SCALE)), max(2, round(height*BAR_SCALE))
+        bar_width, bar_height = width, max(2, round(height*BAR_HEIGHT_SCALE))
         bar_col = max(1, (self.cols - math.ceil(bar_width/self.cw)) // 2 + 1)
         bar_rows = math.ceil(bar_height/self.ch)
         gate_top = 2
@@ -984,7 +984,6 @@ class Screen:
                     self.work_painted = False
             def ink(rgb):
                 return tuple(round(c*reveal) for c in rgb)
-            parts.append(self.text(label_row, self.phase, self.caption_ink("phase", GOLD, tick, reveal)))
             bar_row = label_row + 1
             busy = self.state == "busy"
             if self.art:
@@ -1007,7 +1006,7 @@ class Screen:
                     strip = frame.crop((x1, y1, x2, y2))
                     parts.append(self.image(strip, bar_row + y1 // self.ch, bar_col + x1 // self.cw, palette=self.art.palette))
             else:
-                n = max(1, round(min(54, self.cols - 6)*BAR_SCALE))
+                n = max(1, min(54, self.cols - 6))
                 if self.progress < 0:
                     head = int((math.sin(tick * 2) + 1) / 2 * max(0, n - 5))
                     bar = "·" * head + "━━━━━" + "·" * (n - head - 5)
@@ -1015,6 +1014,9 @@ class Screen:
                     count = self.progress * n // 1000
                     bar = "━" * count + "·" * (n - count)
                 parts.append(self.text(bar_row + bar_rows // 2, bar, ink(GOLD)))
+            # Konsole can invalidate nearby text when placing a wide SIXEL.
+            # Paint the phase after the artwork so it remains visible.
+            parts.append(self.text(label_row, self.phase, self.caption_ink("phase", GOLD, tick, reveal)))
             footer = bar_row + bar_rows
             value = "Receiving data" if self.progress < 0 else f"{self.progress // 10}%"
             if self.state == "error":
@@ -1024,11 +1026,13 @@ class Screen:
             else:
                 parts.append(self.text(footer, value, ink(GOLD)))
                 self.footer_kind = "label"
-            parts.append(self.text(footer + 1, self.detail, self.caption_ink("detail", MUTED, tick, reveal)))
+            # Keep one complete text row between the percentage and caption.
+            parts.append(self.text(footer + 2, self.detail, self.caption_ink("detail", MUTED, tick, reveal)))
+            log_row = min(footer + 4, self.rows - 1)
             for i in range(2):
                 kind, msg = self.logs[-2:][i] if i < len(self.logs) else ("", "")
                 color = (160, 66, 48) if kind in ("fail", "warn") else MUTED
-                parts.append(self.text(footer + 3 + i, msg, self.caption_ink(f"log{i}", color, tick, reveal)))
+                parts.append(self.text(log_row + i, msg, self.caption_ink(f"log{i}", color, tick, reveal)))
         self.send("".join(parts))
         if not self.gate:
             self.work_painted = self.bar_reveal_started is None

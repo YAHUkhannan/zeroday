@@ -452,7 +452,7 @@ class Render(unittest.TestCase):
             self.assertNotEqual(writes[-1], first)
             self.assertNotIn("\x1b[2J", writes[-1])
 
-    def test_smaller_bar_fades_after_motion_and_ready_waits_for_reveal(self):
+    def test_longer_bar_fades_after_motion_and_ready_waits_for_reveal(self):
         with tempfile.TemporaryDirectory() as tmp:
             ready = Path(tmp)/"ready"
             screen = renderer.Screen(1, ROOT/"assets", use_sixel=True, ready_file=ready)
@@ -462,8 +462,8 @@ class Render(unittest.TestCase):
                 screen.render(10)
                 banner_size = renderer.re.search(r'"1;1;(\d+);(\d+)', screen.static["banner"]).groups()
                 bar_size = renderer.re.search(r'"1;1;(\d+);(\d+)', screen.static["bar"]).groups()
-                for full, smaller in zip(banner_size, bar_size):
-                    self.assertEqual(int(smaller), round(int(full)*.8))
+                self.assertEqual(int(bar_size[0]), int(banner_size[0]))
+                self.assertEqual(int(bar_size[1]), round(int(banner_size[1])*.8))
                 deadline = time.monotonic()+6
                 while len(screen.motion_frames)<6*renderer.MOTION_STEPS and time.monotonic()<deadline:
                     time.sleep(.01)
