@@ -28,7 +28,9 @@ while [ $# -gt 0 ]; do
 done
 
 python3 "$DIST/installer-ui/build.py" --template "$DIST/installer/install.sh.in" --output "$DIST/install.sh"
-bash -n "$DIST/install.sh" "$DIST/payload/zeroday-repatch.sh" "$DIST/payload/steam-jupiter.patched"
+for script in "$DIST/install.sh" "$DIST/payload/zeroday-repatch.sh" "$DIST/payload/steam-jupiter.patched"; do
+    bash -n "$script"
+done
 if [ "$SELFTEST" -eq 1 ]; then python3 "$DIST/installer/test_install.py"; fi
 
 echo "==> packing"
