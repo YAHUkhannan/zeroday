@@ -15,22 +15,74 @@ import os
 from pathlib import Path
 import re
 import select
+import shutil
 import signal
+import subprocess
 import sys
 import threading
 import time
 
 try:
-    from PIL import Image, ImageDraw
+    from PIL import Image, ImageDraw, ImageFont
 except ImportError:
     Image = ImageDraw = None
 
-BG = (250, 249, 245)
-INK = (46, 44, 39)
+BG = (0, 0, 0)
+INK = (168, 168, 168)
 GOLD = (192, 142, 72)  # Original reference pixel (800, 450), not a replacement hue.
-MUTED = (126, 116, 98)
-TRACK = (225, 223, 216)
+MUTED = (68, 68, 68)
+TRACK = (36, 32, 26)
 ESC = "\x1b"
+
+
+class Sounds:
+    """Optional, nonblocking cues; never put audio on the animation path."""
+    def __init__(self, directory):
+        self.directory, self.child = directory, None
+        self.retired = []
+        self.command = None
+        if os.environ.get("ZERODAY_UI_SOUND", "1") == "0":
+            return
+        for name, args in (
+            ("pw-play", ["--volume", "0.45"]),
+            ("paplay", ["--volume=29491"]),
+            ("ffplay", ["-nodisp", "-autoexit", "-loglevel", "quiet", "-volume", "45"]),
+        ):
+            if player := shutil.which(name):
+                self.command = [player, *args]
+                break
+
+    def play(self, name):
+        if name not in ("move", "confirm", "cancel") or not self.command:
+            return
+        path = self.directory / f"{name}.wav"
+        if not path.is_file():
+            return
+        if self.child and self.child.poll() is None:
+            self.child.terminate()
+            self.retired.append(self.child)
+        self.retired = [p for p in self.retired if p.poll() is None]
+        try:
+            self.child = subprocess.Popen([*self.command, str(path)],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            self.child = None
+
+    def close(self):
+        if self.child:
+            try:
+                self.child.wait(timeout=1.3)
+            except subprocess.TimeoutExpired:
+                self.child.terminate()
+                try:
+                    self.child.wait(timeout=.2)
+                except subprocess.TimeoutExpired:
+                    self.child.kill()
+                    self.child.wait()
+        for child in self.retired:
+            if child.poll() is None:
+                child.kill()
+            child.wait()
 
 
 def clean(text):
@@ -53,7 +105,9 @@ def sixel(image, palette=None, parts=False):
     out = [f'{ESC}P0;1;0q"1;1;{width};{height}']
     for c in sorted(set(pixels)):
         rgb = palette[c * 3:c * 3 + 3]
-        out.append(f"#{c};2;" + ";".join(str(round(v * 100 / 255)) for v in rgb))
+        # Register zero is transparent in some Konsole drawing paths. Reserve
+        # it so an opaque black pixel really covers the previous picture.
+        out.append(f"#{c+1};2;" + ";".join(str(round(v * 100 / 255)) for v in rgb))
     body_start = len(out)
     for y in range(0, height, 6):
         masks = {}
@@ -63,7 +117,7 @@ def sixel(image, palette=None, parts=False):
                     masks[color] = bytearray(width)
                 masks[color][x] |= 1 << k
         for color, vals in sorted(masks.items()):
-            out.append(f"#{color}")
+            out.append(f"#{color+1}")
             end = len(vals.rstrip(b"\0"))
             start = 0
             while start < end:
@@ -104,20 +158,24 @@ def halfblocks(image, cols, rows):
 
 class Artwork:
     def __init__(self, directory):
-        self.banner = Image.open(directory / "zeroday-banner.png").convert("RGB")
+        def on_black(name):
+            source = Image.open(directory / name).convert("RGBA")
+            canvas = Image.new("RGBA", source.size, (*BG, 255))
+            return Image.alpha_composite(canvas, source).convert("RGB")
+        self.banner = on_black("zeroday-banner-transparent.png")
         original = Image.open(directory / "zeroday-progress.png").convert("RGB")
         # Keep the serpent, dove, frame and the reference's actual metal texture.
         # Rebuild only the interior so the baked-in 60% fill becomes live data.
-        self.empty = original.copy()
+        self.empty = on_black("zeroday-progress-transparent.png")
         interior = Image.new("L", original.size)
         ImageDraw.Draw(interior).polygon(
             [(373, 446), (1644, 446), (1658, 460), (1644, 483), (373, 483), (358, 461)],
             fill=255,
         )
         self.mask = interior
-        empty = original.crop((1190, 446, 1540, 484)).resize((1300, 38))
+        empty = Image.new("RGB", (1300, 38), TRACK)
         gold = original.crop((390, 446, 1060, 484)).resize((1300, 38))
-        empty_canvas = original.copy()
+        empty_canvas = self.empty.copy()
         empty_canvas.paste(empty, (358, 446))
         self.empty.paste(empty_canvas, mask=interior)
         self.full = self.empty.copy()
@@ -185,6 +243,7 @@ class Screen:
         self.fd, self.cw, self.ch = fd, cell_width, cell_height
         self.use_sixel = use_sixel and Image is not None
         self.art = Artwork(assets) if Image else None
+        self.sounds = Sounds(assets / "sounds")
         self.gate = True
         self.mode, self.selection = "install", 0
         self.phase, self.progress, self.detail, self.state = "Ready to install", 0, "", "busy"
@@ -196,6 +255,11 @@ class Screen:
         self.motion_started = None
         self.motion_key = None
         self.motion_frames = {}
+        self.motion_offset = None
+        self.work_painted = False
+        self.arrow_cache = {}
+        self.arrow_location = None
+        self.arrow_frame = None
         self.ready_file = ready_file
         self.static = {}
 
@@ -238,9 +302,16 @@ class Screen:
         if fields[0] == "stop":
             return False
         if fields[0] == "gate" and len(fields) == 3:
+            if self.gate and int(fields[2]) != self.selection:
+                self.sounds.play("move")
+            if not self.gate:
+                self.layout_key = None
+                self.transition_started = self.motion_started = None
             self.gate, self.mode = True, fields[1]
             self.selection = int(fields[2])
         elif fields[0] == "state" and len(fields) == 5:
+            if self.gate:
+                self.sounds.play("confirm")
             if self.gate and self.last_gate is True:
                 self.transition_started = time.monotonic()
                 self.motion_started = None
@@ -249,6 +320,8 @@ class Screen:
             self.progress = max(-1, min(1000, int(fields[2])))
             self.detail, self.state = fields[3:5]
         elif fields[0] == "download" and len(fields) == 5:
+            if self.gate:
+                self.sounds.play("confirm")
             if self.gate and self.last_gate is True:
                 self.transition_started = time.monotonic()
                 self.motion_started = None
@@ -277,6 +350,8 @@ class Screen:
                     self.detail += f"  ·  {seconds // 60}:{seconds % 60:02d} left"
                 elif not total:
                     self.detail += "  ·  size not reported"
+        elif fields[0] == "sound" and len(fields) == 2:
+            self.sounds.play(fields[1])
         elif fields[0] == "log" and len(fields) == 3:
             self.logs = (self.logs + [fields[1:]])[-2:]
         return True
@@ -294,7 +369,7 @@ class Screen:
             for offset in range(6):
                 if self.motion_key != key:
                     return
-                canvas = Image.new("P", (q.width, q.height + 5), 127)
+                canvas = Image.new("P", (q.width, math.ceil((q.height + 6) / 6) * 6), 127)
                 canvas.putpalette(palette)
                 canvas.paste(q, (0, offset))
                 encoded = sixel(canvas, parts=True)
@@ -302,43 +377,118 @@ class Screen:
                     self.motion_frames[offset] = encoded
         threading.Thread(target=build, daemon=True, name="banner-frames").start()
 
+    def button_layout(self):
+        left = max(1, (self.cols - 24) // 2 + 1)
+        return left, left + 15
+
+    def arrow(self, label_row, tick, fade=0):
+        left, right = self.button_layout()
+        center = (left if self.selection == 0 else right) + 4
+        row = label_row + 7
+        phase = (1 - math.cos(2 * math.pi * tick / 0.8)) / 2
+        if not self.art:
+            # Match Grok's glyph and eased two-row fallback.
+            color = tuple(round(208*(1-fade)) for _ in range(3))
+            canvas = ""
+            if self.arrow_location and self.arrow_location != (row, center):
+                oldrow, oldcol = self.arrow_location
+                for y in (oldrow, oldrow+1):
+                    canvas += f"{ESC}[{y};{oldcol}H{ESC}[48;2;0;0;0m {ESC}[0m"
+            self.arrow_location = (row, center)
+            for y, alpha in ((row, 1-phase), (row+1, phase)):
+                level = tuple(round(c*alpha) for c in color)
+                canvas += f"{ESC}[{y};{center}H{ESC}[48;2;0;0;0m{ESC}[38;2;{level[0]};{level[1]};{level[2]}m⌄{ESC}[0m"
+            return canvas
+        key = (self.cw, self.ch)
+        if key not in self.arrow_cache:
+            font_path = next((p for p in (
+                "/usr/share/fonts/TTF/Hack-Regular.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+                "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+            ) if Path(p).is_file()), None)
+            font = ImageFont.truetype(font_path, self.ch) if font_path else ImageFont.load_default()
+            sheet = Image.new("L", (self.ch*4, self.ch*4))
+            ImageDraw.Draw(sheet).text((self.ch, self.ch), "⌄", font=font, fill=255)
+            box = sheet.getbbox()
+            glyph = sheet.crop(box)
+            glyph = glyph.resize((max(1, round(glyph.width*1.5)), max(1, round(glyph.height*1.5))))
+            cols = max(1, math.ceil(glyph.width/self.cw))
+            cols += cols % 2 == 0
+            self.arrow_cache[key] = (glyph, cols*self.cw)
+        glyph, width = self.arrow_cache[key]
+        travel = max(1, min(round(self.ch*0.8), self.ch*2-glyph.height-1))
+        offset = round(phase*travel)
+        level = round(208*(1-fade))
+        frame_key = (key, offset, level, self.use_sixel)
+        cached = self.arrow_cache.get(frame_key)
+        if cached is None:
+            frame = Image.new("RGB", (width, self.ch*2), BG)
+            ink = Image.new("RGB", glyph.size, (level,)*3)
+            frame.paste(ink, ((width-glyph.width)//2, offset), glyph)
+            cached = sixel(frame) if self.use_sixel else halfblocks(frame, width//self.cw, 2)
+            if fade == 0:
+                self.arrow_cache[frame_key] = cached
+        col = max(1, center - width//self.cw//2)
+        location = (row, col)
+        canvas = ""
+        if self.arrow_location is not None and self.arrow_location != location:
+            oldrow, oldcol = self.arrow_location
+            blank = Image.new("RGB", (width, self.ch*2), BG)
+            canvas += self.image(blank, oldrow, oldcol, ("blank-arrow", key))
+        self.arrow_location = location
+        if isinstance(cached, str):
+            return canvas + f"{ESC}[{row};{col}H" + cached
+        return canvas + "".join(f"{ESC}[{row+i};{col}H{line}" for i,line in enumerate(cached))
+
     def gate_words(self, label_row, fade=0):
         def color(rgb):
             return tuple(round(a + (b-a)*fade) for a, b in zip(rgb, BG))
-        title = "INSTALLER PREVIEW" if self.mode == "preview" else "REMOVE ZERODAY" if self.mode == "uninstall" else "INSTALL ZERODAY"
-        verb = "PREVIEW" if self.mode == "preview" else "REMOVE" if self.mode == "uninstall" else "INSTALL"
-        buttons = f"{'[ '+verb+' ]' if self.selection == 0 else '  '+verb+'  '}     {'[ ABORT ]' if self.selection else '  ABORT  '}"
+        verb = "REMOVE" if self.mode == "uninstall" else "INSTALL"
+        left, right = self.button_layout()
+        button_color = color((88, 88, 88))
+        buttons = ""
+        for col,label in ((left,verb),(right,"ABORT")):
+            buttons += (f"{ESC}[{label_row+9};{col}H{ESC}[48;2;0;0;0m"
+                        f"{ESC}[38;2;{button_color[0]};{button_color[1]};{button_color[2]}m{label:^9}{ESC}[0m")
+        hint = "INSTALLER PREVIEW · Enter to try / arrows to choose / Q to close" if self.mode == "preview" else "Enter to continue / arrows to choose / Q to close"
         return "".join([
-            self.text(label_row, title, color(GOLD)),
-            self.text(label_row+2, "wise as serpents, harmless as doves", color(MUTED)),
-            self.text(label_row+4, buttons, color(INK)),
-            self.text(label_row+6, "Enter to continue  /  arrows to choose  /  Q to close", color(MUTED)),
+            self.text(label_row, "ZERODAY", color(INK)),
+            self.text(label_row+2, "SERPENTS // DOVES", color(MUTED)),
+            self.text(label_row+4, "be ye therefore wise as serpents, and harmless as doves", color((108,)*3)),
+            self.text(label_row+5, "Mattith'YAHU 10:16", color(MUTED)),
+            buttons,
+            self.text(label_row+11, hint, color(MUTED)),
         ])
 
     def transition(self, tick, top, col, drop, label_row, banner):
         elapsed = max(0, tick - self.transition_started)
         if elapsed < 0.8:
             t = elapsed / 0.8
-            self.send(self.gate_words(label_row, t*t*(3-2*t)))
+            fade = t*t*(3-2*t)
+            self.send(self.gate_words(label_row, fade) + self.arrow(label_row, tick, fade))
             return True
         if self.use_sixel and len(self.motion_frames) < 6:
             self.send(self.gate_words(label_row, 1))
             return True
         if self.motion_started is None:
             self.motion_started = tick
+            self.send(self.gate_words(label_row, 1) + self.arrow(label_row, tick, 1))
         t = min(1, (tick - self.motion_started) / 2.4)
-        if t >= 1:
-            self.transition_started = self.motion_started = None
-            self.layout_key = self.last_signature = None
-            return False
         distance = drop * self.ch
         offset = round(distance * t*t*(3-2*t))
-        canvas = f"{ESC}[48;2;{BG[0]};{BG[1]};{BG[2]}m{ESC}[2J"
+        if self.motion_offset == offset and t < 1:
+            return True
+        self.motion_offset = offset
+        canvas = ""
         if self.use_sixel:
             w, h, definitions, data = self.motion_frames[offset % 6]
             bands = offset // 6
-            blank = (f"#127!{w}~$-") * bands
-            raster = f'{ESC}P0;1;0q"1;1;{w};{h+bands*6}' + definitions + blank + data
+            full_height = math.ceil((banner.height + distance + 6) / 6) * 6
+            blank = (f"#128!{w}~$-") * bands
+            tail = (f"-#128!{w}~$") * ((full_height - h) // 6 - bands)
+            # Paint the same opaque rectangle at the same anchor every time.
+            # Clearing ED2 between pictures made Konsole flash an empty frame.
+            raster = f'{ESC}P0;1;0q"1;1;{w};{full_height}' + definitions + blank + data[:-2] + tail + f"{ESC}\\"
             canvas += f"{ESC}[{top};{col}H" + raster
         elif self.art:
             # Half-block terminals use the same pixel movement sampled into
@@ -347,8 +497,14 @@ class Screen:
             layer.paste(banner, (0, offset))
             canvas += self.image(layer, top, col)
         else:
+            for row in range(top, top + drop + 4):
+                canvas += self.text(row, "")
             canvas += self.text(top + offset // self.ch + 2, "Z E R O D A Y", GOLD)
         self.send(canvas)
+        if t >= 1:
+            self.transition_started = self.motion_started = None
+            self.last_signature = None
+            return False
         return True
 
     def render(self, tick):
@@ -359,12 +515,15 @@ class Screen:
         mode_changed = self.gate != self.last_gate
         signature = (key, self.gate, self.mode, self.selection, self.phase,
                      self.progress, self.detail, self.state, tuple(tuple(log) for log in self.logs))
-        animated = self.transition_started is not None or (not self.gate and self.state == "busy" and self.progress != 0)
+        animated = self.gate or self.transition_started is not None or (not self.gate and self.state == "busy" and self.progress != 0)
         if signature == self.last_signature and not animated:
             return
         self.last_signature, self.last_gate = signature, self.gate
         if redraw:
             self.layout_key, self.static = key, {}
+            self.work_painted = False
+            self.motion_offset = None
+            self.arrow_location = None
         parts = []
         if redraw:
             parts.append(f"{ESC}[48;2;{BG[0]};{BG[1]};{BG[2]}m{ESC}[2J{ESC}[H")
@@ -379,7 +538,7 @@ class Screen:
             return
         # Leave room for the downward movement; the banner's size stays fixed.
         drop = max(2, min(4, self.rows // 10))
-        reserve = 11 + drop
+        reserve = max(15, 11 + drop)
         budget = max(1, (self.rows - reserve) * self.ch)
         width = min((self.cols - 4) * self.cw, 1120, int(budget * 4 / 3))
         width = max(self.cw, width // self.cw * self.cw)
@@ -391,6 +550,8 @@ class Screen:
         if self.art:
             banner, empty, _, _ = self.art.fit(width, height)
             if self.transition_started is not None:
+                if redraw:
+                    self.send("".join(parts))
                 self.prepare_motion(banner)
                 if self.transition(tick, gate_top, col, drop, gate_top + image_rows + 1, banner):
                     return
@@ -408,7 +569,9 @@ class Screen:
             for row in range(label_row, self.rows + 1):
                 parts.append(self.text(row, ""))
         if self.gate:
-            parts.append(self.gate_words(label_row))
+            if redraw or mode_changed:
+                parts.append(self.gate_words(label_row))
+            parts.append(self.arrow(label_row, tick))
             if self.art and "bar" not in self.static:
                 # Prepare the static ornament once, before the user clicks.
                 # Switching screens then needs no full-picture quantization.
@@ -418,7 +581,7 @@ class Screen:
             bar_row = label_row + 1
             busy = self.state == "busy"
             if self.art:
-                if redraw or mode_changed:
+                if redraw or mode_changed or not self.work_painted:
                     parts.append(self.image(empty, bar_row, col, "bar"))
                 frame = self.art.bar(width, height, self.progress, tick, busy)
                 # Repaint only the horizontal track, leaving the ornaments and
@@ -449,6 +612,8 @@ class Screen:
                 color = (160, 66, 48) if kind in ("fail", "warn") else MUTED
                 parts.append(self.text(footer + 3 + i, msg, color))
         self.send("".join(parts))
+        if not self.gate:
+            self.work_painted = True
         self.mark_ready()
         if self.gate and self.use_sixel:
             self.prepare_motion(banner)
@@ -471,7 +636,7 @@ def main():
     try:
         running = True
         while running:
-            ready, _, _ = select.select([0], [], [], 0.05)
+            ready, _, _ = select.select([0], [], [], 1/60)
             if ready:
                 data = os.read(0, 65536)
                 if not data:
@@ -485,6 +650,7 @@ def main():
                 screen.render(time.monotonic())
     finally:
         screen.send(f"{ESC}[0m{ESC}[?7h{ESC}[?25h{ESC}[?1049l")
+        screen.sounds.close()
 
 
 if __name__ == "__main__":

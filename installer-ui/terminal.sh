@@ -70,7 +70,7 @@ ui_start() {
 	IFS= read -rs -t 0.2 -d $'\a' background <&3 || true
 	if [[ "$background" =~ (rgb:[0-9a-fA-F]+/[0-9a-fA-F]+/[0-9a-fA-F]+) ]]; then
 		UI_BACKGROUND_OLD=${BASH_REMATCH[1]}
-		ui '\033]11;#faf9f5\a'
+		ui '\033]11;#000000\a'
 	fi
 	rm -f "$UI_TMP/events" "$UI_TMP/screen-ready"
 	mkfifo -m 600 "$UI_TMP/events"
@@ -146,16 +146,18 @@ ui_arm() {
 	[ "$INTERACTIVE" -eq 1 ] || return 0
 	ui_start
 	local key selection=0
+	rm -f "$UI_TMP/screen-ready"
 	ui_send gate "$UI_MODE" "$selection"
 	while true; do
 		ui_key
 		key=$UI_KEY
 		case "$key" in
-			'[C'|$'\t') selection=$((1-selection)) ;;
+			'[C') selection=1 ;;
+			$'\t') selection=$((1-selection)) ;;
 			'[D') selection=0 ;;
-			q|Q) return 1 ;;
+			q|Q) ui_send sound cancel; return 1 ;;
 			$' '|$'\025')
-				[ "$selection" -eq 0 ] || return 1
+				if [ "$selection" -ne 0 ]; then ui_send sound cancel; return 1; fi
 				UI_LIVE=1; UI_PCT=0; UI_PHASE="Getting ready"
 				ui_draw_progress
 				# Finish the visual transition before a password prompt or another
@@ -220,6 +222,7 @@ ui_preview() {
 	trap ui_restore EXIT
 	trap 'exit 130' INT
 	trap 'exit 143' TERM
+	while true; do
 	ui_arm preview || return 0
 	if [ -n "${OPT_PREVIEW_URL:-}" ]; then
 		ui_fetch "$UI_TMP/preview-download" "$OPT_PREVIEW_URL" 0 1000 || {
@@ -235,6 +238,8 @@ ui_preview() {
 			sleep 0.07
 		done
 	fi
-	ui_send state "Preview complete" 1000 "Press any key to close" done
+	ui_send state "Preview complete" 1000 "R to replay / any other key to close" done
 	ui_key >/dev/null
+	case "$UI_KEY" in r|R) ;; *) return 0 ;; esac
+	done
 }

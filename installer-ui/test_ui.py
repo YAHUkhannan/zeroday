@@ -18,6 +18,7 @@ import unittest
 from unittest import mock
 import fcntl
 
+os.environ["ZERODAY_UI_SOUND"] = "0"
 ROOT = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("renderer", ROOT / "renderer.py")
 renderer = importlib.util.module_from_spec(spec)
@@ -179,7 +180,7 @@ ui_fetch "$2" "$3" 0 1000
                 self.assertFalse(list(Path(tmp).glob("zeroday-ui.*")))
                 self.assertFalse((Path(tmp)/".local/share/ZeroDay").exists())
                 self.assertIn(b"\x1b[?1049l", data)
-                self.assertIn(b"\x1b]11;#faf9f5\x07", data)
+                self.assertIn(b"\x1b]11;#000000\x07", data)
                 self.assertIn(b"\x1b]11;rgb:2323/2626/2727\x07", data)
                 if sixel:
                     self.assertIn(b"\x1bP0;1;0q", data)
@@ -206,6 +207,82 @@ ui_fetch "$2" "$3" 0 1000
 
 
 class Render(unittest.TestCase):
+    def test_black_theme_restores_original_copy_and_transparent_art(self):
+        self.assertEqual(renderer.BG, (0, 0, 0))
+        screen = renderer.Screen(1, ROOT/"assets")
+        screen.cols, screen.rows = 110, 36
+        words = screen.gate_words(15)
+        for phrase in ("ZERODAY", "SERPENTS // DOVES",
+                       "be ye therefore wise as serpents, and harmless as doves",
+                       "Mattith'YAHU 10:16", "INSTALL", "ABORT"):
+            self.assertIn(phrase, words)
+        for name in ("banner", "progress"):
+            image = renderer.Image.open(ROOT/"assets"/f"zeroday-{name}-transparent.png")
+            self.assertEqual(image.mode, "RGBA")
+            self.assertEqual(image.size, (2048, 768))
+            self.assertLessEqual(image.getpixel((0, 0))[3], 1)
+            self.assertGreater(image.getchannel("A").histogram()[0], image.width*image.height//2)
+        self.assertEqual(screen.art.banner.getpixel((0, 0)), (0, 0, 0))
+
+    def test_bouncing_arrow_follows_selection_without_repainting_banner(self):
+        screen = renderer.Screen(1, ROOT/"assets")
+        screen.mode = "preview"
+        writes = []
+        screen.send = writes.append
+        with mock.patch.object(renderer.os, "get_terminal_size", return_value=os.terminal_size((110, 36))):
+            screen.render(10)
+            original_location = screen.arrow_location
+            screen.render(10.2)
+            first = writes[-1]
+            screen.render(10.4)
+            self.assertNotEqual(writes[-1], first)
+            self.assertNotIn("SERPENTS // DOVES", writes[-1])
+            self.assertNotIn("\x1b[2J", writes[-1])
+            screen.accept(b"gate\x1fpreview\x1f1")
+            screen.render(10.5)
+            self.assertEqual(screen.arrow_location[0], original_location[0])
+            self.assertEqual(screen.arrow_location[1]-original_location[1], 15)
+            self.assertNotIn("".join(screen.static["banner"]), writes[-1])
+
+    def test_sixel_motion_uses_fixed_opaque_canvas_without_screen_clear(self):
+        screen = renderer.Screen(1, ROOT/"assets", use_sixel=True)
+        writes = []
+        screen.send = writes.append
+        with mock.patch.object(renderer.os, "get_terminal_size", return_value=os.terminal_size((80, 30))):
+            screen.render(10)
+            deadline = time.monotonic()+6
+            while len(screen.motion_frames)<6 and time.monotonic()<deadline:
+                time.sleep(.01)
+            self.assertEqual(len(screen.motion_frames), 6)
+            with mock.patch.object(renderer.time, "monotonic", return_value=10):
+                screen.accept(b"state\x1fInstalling\x1f0\x1f\x1fbusy")
+            screen.render(10.9)
+            writes.clear()
+            for tick in (11, 11.3, 11.8, 12.4):
+                screen.render(tick)
+            self.assertNotIn("\x1b[2J", "".join(writes))
+            sizes = []
+            anchors = []
+            for frame in writes:
+                sizes.extend(renderer.re.findall(r'\x1bP0;1;0q"1;1;(\d+);(\d+)', frame))
+                anchors.extend(renderer.re.findall(r'\x1b\[(\d+);(\d+)H\x1bP', frame))
+            self.assertGreater(len(sizes), 2)
+            self.assertEqual(len(set(sizes)), 1)
+            self.assertEqual(len(set(anchors)), 1)
+
+    def test_sound_names_match_actions_without_repeating_for_progress(self):
+        screen = renderer.Screen(1, ROOT/"assets")
+        screen.sounds = mock.Mock()
+        screen.accept(b"gate\x1fpreview\x1f0")
+        screen.accept(b"gate\x1fpreview\x1f1")
+        screen.accept(b"gate\x1fpreview\x1f1")
+        screen.accept(b"gate\x1fpreview\x1f0")
+        screen.accept(b"state\x1fGetting ready\x1f0\x1f\x1fbusy")
+        screen.accept(b"state\x1fDownloading\x1f500\x1f\x1fbusy")
+        screen.accept(b"sound\x1fcancel")
+        self.assertEqual(screen.sounds.play.call_args_list,
+                         [mock.call("move"),mock.call("move"),mock.call("confirm"),mock.call("cancel")])
+
     def test_install_fades_words_then_moves_banner_down_without_resizing(self):
         screen = renderer.Screen(1, ROOT/"assets")
         writes = []
@@ -220,11 +297,11 @@ class Render(unittest.TestCase):
                 screen.accept(b"state\x1fInstalling\x1f500\x1f\x1fbusy")
             screen.render(10.4)
             self.assertNotIn("\x1b[2J", writes[-1])
-            self.assertIn("INSTALL ZERODAY", writes[-1])
+            self.assertIn("SERPENTS // DOVES", writes[-1])
             screen.render(10.9)
             screen.render(12)
-            self.assertIn("\x1b[2J", writes[-1])
-            self.assertNotIn("INSTALL ZERODAY", writes[-1])
+            self.assertNotIn("\x1b[2J", "".join(writes))
+            self.assertNotIn("SERPENTS // DOVES", writes[-1])
             self.assertNotIn("Installing", writes[-1])
             screen.render(13.4)
             self.assertIn("Installing", writes[-1])
@@ -232,7 +309,7 @@ class Render(unittest.TestCase):
             final_row = int(renderer.re.search(r"\x1b\[(\d+);\d+H", writes[-1]).group(1))
             self.assertGreater(final_row, original_row)
 
-    def test_gate_and_finished_screen_do_not_redraw_while_idle(self):
+    def test_gate_redraws_only_arrow_and_finished_screen_stays_idle(self):
         screen = renderer.Screen(1, ROOT/"assets")
         writes = []
         screen.send = writes.append
@@ -240,7 +317,10 @@ class Render(unittest.TestCase):
             screen.render(1)
             count = len(writes)
             screen.render(2)
-            self.assertEqual(len(writes), count)
+            self.assertEqual(len(writes), count+1)
+            self.assertNotIn("\x1b[2J", writes[-1])
+            self.assertNotIn("SERPENTS // DOVES", writes[-1])
+            self.assertNotIn("".join(screen.static["banner"]), writes[-1])
             screen = renderer.Screen(1, ROOT/"assets")
             screen.send = writes.append
             screen.accept(b"state\x1fFinished\x1f1000\x1f\x1fdone")
