@@ -69,7 +69,7 @@ ui_start() {
 		UI_BACKGROUND_OLD=${BASH_REMATCH[1]}
 		ui '\033]11;#000000\a'
 	fi
-	rm -f "$UI_TMP/events" "$UI_TMP/screen-ready" "$UI_TMP/gate-ready"
+	rm -f "$UI_TMP/events" "$UI_TMP/screen-ready" "$UI_TMP/gate-ready" "$UI_TMP/disclaimer-ready"
 	mkfifo -m 600 "$UI_TMP/events"
 	python3 "$UI_TMP/renderer.py" --fd "$UI_FD" --assets "$UI_TMP/assets" --ready-file "$UI_TMP/screen-ready" --cell-width "$cw" --cell-height "$ch" "${graphics[@]}" < "$UI_TMP/events" 2>"$UI_TMP/renderer.log" &
 	UI_PID=$!
@@ -155,8 +155,25 @@ ui_arm() {
 	[ "$INTERACTIVE" -eq 1 ] || return 0
 	ui_start
 	local key selection=0
-	rm -f "$UI_TMP/screen-ready" "$UI_TMP/gate-ready"
-	ui_send gate "$UI_MODE" "$selection"
+	rm -f "$UI_TMP/screen-ready" "$UI_TMP/gate-ready" "$UI_TMP/disclaimer-ready"
+	ui_send disclaimer "$UI_MODE"
+	while [ ! -f "$UI_TMP/gate-ready" ]; do
+		while [ ! -f "$UI_TMP/disclaimer-ready" ] && [ ! -f "$UI_TMP/gate-ready" ]; do
+			kill -0 "$UI_PID" 2>/dev/null || return 1
+			sleep 0.01
+		done
+		[ ! -f "$UI_TMP/gate-ready" ] || break
+		ui_key
+		case "$UI_KEY" in
+			q|Q) ui_send sound cancel; return 1 ;;
+			$' '|$'\025')
+				rm -f "$UI_TMP/disclaimer-ready"
+				ui_send disclaimer-next ;;
+			'[A'|'[D')
+				rm -f "$UI_TMP/disclaimer-ready"
+				ui_send disclaimer-back ;;
+		esac
+	done
 	# A queued first Enter must follow the opening paint, so it still gets
 	# the confirmation cue and full transition instead of skipping the menu.
 	while [ ! -f "$UI_TMP/gate-ready" ]; do

@@ -150,29 +150,42 @@ ui_fetch "$2" "$3" 0 1000
             proc.stdin.close()
             data = bytearray()
             entered = stopped = False
+            disclaimer_pages = set()
+            startup_entered = False
             entered_at = 0
-            deadline = time.monotonic() + 12
+            deadline = time.monotonic() + 20
             try:
                 while proc.poll() is None and time.monotonic() < deadline:
                     if select.select([master], [], [], .1)[0]:
                         block = os.read(master, 1048576)
                         data.extend(block)
                         if b"\x1b[c" in block:
-                            if early_enter and not entered:
+                            if early_enter and not startup_entered:
                                 # A user can press Enter while the terminal is
                                 # answering DA, before the menu has painted.
                                 os.write(master, b"\r")
-                                entered = True
-                                entered_at = time.monotonic()
+                                startup_entered = True
                             os.write(master, b"\x1b[?62;4;22c" if sixel else b"\x1b[?1;2c")
                         if b"\x1b[16t" in block:
                             os.write(master, b"\x1b[6;18;9t")
                         if b"\x1b]11;?\x07" in block:
                             os.write(master, b"\x1b]11;rgb:2323/2626/2727\x07")
+                    for ready in Path(tmp).glob("zeroday-ui.*/disclaimer-ready"):
+                        try:
+                            page = ready.read_text()
+                        except FileNotFoundError:
+                            continue
+                        if page and page not in disclaimer_pages:
+                            disclaimer_pages.add(page)
+                            if not (startup_entered and page.startswith("0:")):
+                                os.write(master, b"\r")
+                    if cancel == "disclaimer" and not stopped and b"ZeroDay" in data:
+                        os.kill(proc.pid, signal.SIGTERM)
+                        stopped = True
                     if cancel == "gate" and not stopped and b"INSTALLER PREVIEW" in data:
                         os.kill(proc.pid, signal.SIGTERM)
                         stopped = True
-                    if not entered and cancel != "gate" and b"INSTALLER PREVIEW" in data:
+                    if not entered and cancel not in ("gate", "disclaimer") and b"INSTALLER PREVIEW" in data:
                         os.write(master, b"\r")
                         entered = True
                         entered_at = time.monotonic()
@@ -201,12 +214,12 @@ ui_fetch "$2" "$3" 0 1000
 
     def test_piped_stdin_uses_tty_and_downloads_without_installing(self):
         data = self.terminal_preview()
-        self.assertIn(b"Preview complete", data)
+        self.assertIn(b"Preview complete", data, data[-2000:])
 
     def test_sixel_terminal_negotiation_and_cleanup(self):
         self.terminal_preview(sixel=True)
 
-    def test_single_enter_during_startup_is_preserved(self):
+    def test_startup_enter_advances_disclaimer_and_menu_still_requires_confirmation(self):
         data = self.terminal_preview(early_enter=True)
         self.assertIn(b"INSTALLER PREVIEW", data)
         self.assertIn(b"Preview complete", data)
@@ -217,6 +230,93 @@ ui_fetch "$2" "$3" 0 1000
     def test_cancel_at_gate_does_not_wait_for_a_keypress(self):
         self.terminal_preview(cancel="gate")
 
+    def test_cancel_during_disclaimer_restores_terminal_without_opening_menu(self):
+        data = self.terminal_preview(cancel="disclaimer")
+        self.assertNotIn(b"INSTALLER PREVIEW", data)
+
+
+class Disclaimer(unittest.TestCase):
+    def test_all_copy_is_reachable_and_idle_page_does_not_redraw(self):
+        for cols, rows in ((110, 36), (80, 24), (40, 12), (24, 8)):
+            with self.subTest(size=(cols, rows)):
+                screen = renderer.Screen(1, ROOT/"assets", intro=True)
+                screen.art = None
+                writes = []
+                screen.send = writes.append
+                with mock.patch.object(renderer.os, "get_terminal_size", return_value=os.terminal_size((cols, rows))):
+                    screen.render(10)
+                    screen.render(12)
+                    count = len(writes)
+                    screen.render(13)
+                    self.assertEqual(len(writes), count)
+                    collected = []
+                    for _ in range(100):
+                        *_, capacity, framed, lines = screen.disclaimer_layout()
+                        collected += lines[screen.disclaimer_offset:screen.disclaimer_offset+capacity]
+                        if screen.disclaimer_last:
+                            break
+                        screen.accept(b"disclaimer-next")
+                        screen.render(14)
+                    else:
+                        self.fail("pagination never reached the end")
+                    self.assertEqual(" ".join(" ".join(collected).split()),
+                                     " ".join(screen.disclaimer_text.split()))
+                    self.assertNotIn("INSTALLER PREVIEW", "".join(writes))
+                    self.assertIn("Or does it?", " ".join(collected))
+
+    def test_resize_reflows_copy_and_back_returns_to_start(self):
+        screen = renderer.Screen(1, ROOT/"assets", intro=True)
+        screen.art = None
+        screen.send = lambda value: None
+        with mock.patch.object(renderer.os, "get_terminal_size", return_value=os.terminal_size((80, 24))):
+            screen.render(10)
+            screen.accept(b"disclaimer-next")
+            screen.render(12)
+            self.assertGreater(screen.disclaimer_offset, 0)
+        with mock.patch.object(renderer.os, "get_terminal_size", return_value=os.terminal_size((110, 36))):
+            screen.render(13)
+            width = screen.disclaimer_layout()[6]
+            for _ in range(20):
+                screen.accept(b"disclaimer-back")
+                screen.render(14)
+            self.assertEqual(screen.disclaimer_offset, 0)
+            self.assertGreater(width, 40)
+
+    def test_fades_disclaimer_out_then_banner_in_before_menu_and_readiness(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ready = Path(tmp)/"screen-ready"
+            screen = renderer.Screen(1, ROOT/"assets", use_sixel=True, ready_file=ready, intro=True)
+            screen.mode = "preview"
+            writes = []
+            screen.send = writes.append
+            with mock.patch.object(renderer.os, "get_terminal_size", return_value=os.terminal_size((110, 36))):
+                screen.render(10)
+                self.assertFalse(ready.with_name("disclaimer-ready").exists())
+                screen.render(11.3)
+                self.assertTrue(ready.with_name("disclaimer-ready").exists())
+                definitions = renderer.re.findall(r'#\d+;2;(\d+);(\d+);(\d+)', writes[-1])
+                self.assertTrue(any(any(int(c)>0 for c in rgb) for rgb in definitions))
+                screen.accept(b"disclaimer-next")
+                screen.render(11.4)
+                self.assertIn('"1;1;', writes[-1], "changing pages erased the SIXEL frame")
+                screen.disclaimer_offset = len(screen.disclaimer_layout()[-1])-1
+                screen.render(12)
+                with mock.patch.object(renderer.time, "monotonic", return_value=12):
+                    screen.accept(b"disclaimer-next")
+                screen.render(12.4)
+                self.assertNotIn("\x1b[2J", writes[-1])
+                screen.render(12.9)
+                self.assertFalse(screen.disclaimer)
+                self.assertNotIn("SERPENTS // DOVES", writes[-1])
+                screen.render(13.5)
+                self.assertNotIn("SERPENTS // DOVES", writes[-1])
+                self.assertFalse(ready.with_name("gate-ready").exists())
+                screen.render(14.3)
+                self.assertIn("SERPENTS // DOVES", writes[-1])
+                self.assertFalse(ready.with_name("gate-ready").exists())
+                screen.render(15)
+                self.assertTrue(ready.with_name("gate-ready").exists())
+                self.assertIsNone(screen.opening_started)
 
 class Render(unittest.TestCase):
     def test_black_theme_restores_original_copy_and_transparent_art(self):

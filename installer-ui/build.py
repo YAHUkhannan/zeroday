@@ -11,7 +11,8 @@ import tarfile
 def archive(ui):
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w") as tar:
-        for relative in ("renderer.py", "assets/zeroday-banner.png", "assets/zeroday-progress.png",
+        for relative in ("renderer.py", "disclaimer.txt", "assets/zeroday-disclaimer-frame.png",
+                         "assets/zeroday-banner.png", "assets/zeroday-progress.png",
                          "assets/zeroday-banner-transparent.png", "assets/zeroday-progress-transparent.png",
                          "assets/sounds/move.wav", "assets/sounds/confirm.wav", "assets/sounds/cancel.wav"):
             data = (ui / relative).read_bytes()

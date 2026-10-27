@@ -2,6 +2,8 @@
 
 The interface keeps the original installer's black canvas, muted text, verse and bouncing selection arrow. It uses the supplied ZeroDay banner and serpent-and-dove progress artwork, with transparent PNG copies composited onto black. The downloaded originals remain byte for byte intact. The filling track uses the original reference image's gold texture, with a subtle moving glint.
 
+The opening screen displays the exact copy in `disclaimer.txt` inside the supplied gold frame. The frame and text fade in together over 1.2 seconds. Text wraps at the current terminal size and uses pages when needed: Enter advances, Up returns to the previous page, and Q aborts. The final Enter fades the disclaimer out over 0.8 seconds. The ZeroDay banner then fades in over 1.2 seconds, followed by the verse, selection arrow and INSTALL/ABORT choices over 0.8 seconds. Installation still requires a separate confirmation at that menu. The renderer uses the existing smooth easing, frame deadlines and cached palette fades. Resizing reflows the disclaimer; idle pages do not redraw. Noninteractive `--yes` keeps its existing behavior.
+
 Run a preview without installing anything:
 
 ```sh

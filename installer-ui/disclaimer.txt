@@ -1,0 +1,26 @@
+ZeroDay — Disclaimer
+
+ZeroDay is provided "AS IS," without warranties or guarantees of any kind.
+
+This software may modify files, configurations, or other parts of your system. I've done my best to make everything work as intended, but computers have a remarkable ability to develop problems nobody asked for.
+
+By continuing, you acknowledge that:
+
+- You are responsible for reviewing and authorizing changes made to your system.
+- Backing up important files and configurations before proceeding is strongly recommended.
+- You are responsible for complying with applicable laws, software licenses, and third-party terms.
+- To the extent permitted by applicable law, I am not liable for data loss, system damage, unexpected behavior, or other consequences arising from the use of ZeroDay.
+
+Please proceed responsibly. Your computer has feelings. Probably.
+
+---
+
+Filipino-made and independently maintained in the Philippines.
+
+Maintained by one developer, assisted by AI agents who are remarkably confident for entities that occasionally invent functions that don't exist.
+
+---
+
+And remember: ZeroDay does not exist.
+
+Or does it?

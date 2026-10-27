@@ -3,6 +3,8 @@
 
 Records on stdin are separated by RS (0x1e); fields by US (0x1f).
   gate <install|uninstall|preview> <selection>
+  disclaimer <install|uninstall|preview>
+  disclaimer-next / disclaimer-back
   state <phase> <0..1000|-1> <detail> <busy|done|error>
   log <kind> <message>
   stop
@@ -23,6 +25,7 @@ import struct
 import sys
 import threading
 import termios
+import textwrap
 import time
 import wave
 
@@ -42,6 +45,9 @@ FRAME_PERIOD = 1 / 60
 BAR_SCALE = 0.8
 BAR_FADE_SECONDS = 0.65
 TEXT_FADE_SECONDS = 0.4
+INTRO_FADE_SECONDS = 1.2
+OUTRO_FADE_SECONDS = 0.8
+MENU_FADE_SECONDS = 0.8
 
 
 class Sounds:
@@ -238,6 +244,7 @@ class Artwork:
             canvas = Image.new("RGBA", source.size, (*BG, 255))
             return Image.alpha_composite(canvas, source).convert("RGB")
         self.banner = on_black("zeroday-banner-transparent.png")
+        self.disclaimer_frame = on_black("zeroday-disclaimer-frame.png")
         original = Image.open(directory / "zeroday-progress.png").convert("RGB")
         # Keep the serpent, dove, frame and the reference's actual metal texture.
         # Rebuild only the interior so the baked-in 60% fill becomes live data.
@@ -321,7 +328,7 @@ class Artwork:
 
 
 class Screen:
-    def __init__(self, fd, assets, cell_width=9, cell_height=18, use_sixel=False, ready_file=None):
+    def __init__(self, fd, assets, cell_width=9, cell_height=18, use_sixel=False, ready_file=None, intro=False):
         self.fd, self.cw, self.ch = fd, cell_width, cell_height
         self.use_sixel = use_sixel and Image is not None
         self.sounds = Sounds(assets / "sounds")
@@ -348,8 +355,26 @@ class Screen:
         self.static = {}
         self.caption_state = {}
         self.caption_fades = {}
+        self.disclaimer = intro
+        self.disclaimer_text = (assets.parent / "disclaimer.txt").read_text()
+        self.disclaimer_offset = 0
+        self.disclaimer_started = None
+        self.disclaimer_leaving = None
+        self.disclaimer_signature = None
+        self.disclaimer_last = False
+        self.disclaimer_step = 1
+        self.opening_started = None
+
+    def reading_ready(self, last):
+        if self.ready_file:
+            target = self.ready_file.with_name("disclaimer-ready")
+            value = f"{self.disclaimer_offset}:{int(last)}"
+            if not target.exists() or target.read_text() != value:
+                target.write_text(value)
 
     def mark_ready(self):
+        if self.disclaimer or self.opening_started is not None:
+            return
         if self.ready_file:
             target = self.ready_file.with_name("gate-ready") if self.gate else self.ready_file
             if self.gate or (self.transition_started is None and self.bar_reveal_started is None):
@@ -453,7 +478,22 @@ class Screen:
         fields = record.decode("utf-8", errors="replace").split("\x1f")
         if fields[0] == "stop":
             return False
-        if fields[0] == "gate" and len(fields) == 3:
+        if fields[0] == "disclaimer" and len(fields) == 2:
+            self.disclaimer, self.mode, self.gate = True, fields[1], True
+            self.disclaimer_offset = 0
+            self.disclaimer_started = self.disclaimer_leaving = None
+            self.disclaimer_signature = self.layout_key = None
+            self.opening_started = None
+        elif fields[0] in ("disclaimer-next", "disclaimer-back"):
+            if self.disclaimer and self.disclaimer_leaving is None:
+                if fields[0] == "disclaimer-next" and self.disclaimer_last:
+                    self.disclaimer_leaving = time.monotonic()
+                else:
+                    delta = self.disclaimer_step * (1 if fields[0] == "disclaimer-next" else -1)
+                    self.disclaimer_offset = max(0, self.disclaimer_offset + delta)
+                    self.disclaimer_signature = None
+            return True
+        elif fields[0] == "gate" and len(fields) == 3:
             if self.gate and int(fields[2]) != self.selection:
                 self.sounds.play("move")
             if not self.gate:
@@ -462,9 +502,11 @@ class Screen:
                 self.bar_reveal_started = None
                 self.caption_state.clear()
                 self.caption_fades.clear()
+                self.opening_started = time.monotonic()
             self.gate, self.mode = True, fields[1]
             self.selection = int(fields[2])
         elif fields[0] == "state" and len(fields) == 5:
+            self.disclaimer = False
             if self.gate:
                 self.sounds.play("confirm")
             if self.gate and self.last_gate is True:
@@ -475,6 +517,7 @@ class Screen:
             self.progress = max(-1, min(1000, int(fields[2])))
             self.detail, self.state = fields[3:5]
         elif fields[0] == "download" and len(fields) == 5:
+            self.disclaimer = False
             if self.gate:
                 self.sounds.play("confirm")
             if self.gate and self.last_gate is True:
@@ -510,6 +553,79 @@ class Screen:
         elif fields[0] == "log" and len(fields) == 3:
             self.logs = (self.logs + [fields[1:]])[-2:]
         return True
+
+    def disclaimer_layout(self):
+        # Fit the original frame without stretching it. Native terminal text
+        # remains sharp in SIXEL and half-block terminals alike.
+        width = max(1, self.cols - 2) * self.cw
+        height = max(1, self.rows - 2) * self.ch
+        ratio = 1672 / 941
+        width = min(width, int(height * ratio))
+        height = max(1, int(width / ratio))
+        columns = max(1, width // self.cw)
+        image_rows = max(1, math.ceil(height / self.ch))
+        left = max(1, (self.cols-columns)//2+1)
+        top = max(1, (self.rows-image_rows)//2+1)
+        margin = max(2, math.ceil(columns*.16))
+        x = left + margin
+        y = top + max(1, math.ceil(image_rows*.18))
+        text_width = max(1, columns-2*margin)
+        bottom = top + max(2, int(image_rows*.82))
+        if text_width < 24 or bottom-y < 6:
+            # Very narrow/short windows retain all copy through pagination.
+            x, y, text_width, bottom = 2, 2, max(1, self.cols-3), max(4, self.rows-1)
+            framed = False
+        else:
+            framed = True
+        lines = []
+        for paragraph in self.disclaimer_text.strip().splitlines():
+            lines.extend(textwrap.wrap(paragraph, text_width, subsequent_indent="  " if paragraph.startswith("- ") else "",
+                                       break_long_words=True, break_on_hyphens=False) or [""])
+        capacity = max(1, bottom-y-2)
+        self.disclaimer_offset = min(self.disclaimer_offset, max(0, len(lines)-1))
+        self.disclaimer_step = capacity
+        self.disclaimer_last = self.disclaimer_offset + capacity >= len(lines)
+        return (width, height, left, top, x, y, text_width, capacity, framed, lines)
+
+    def render_disclaimer(self, tick, redraw, parts):
+        if self.disclaimer_started is None:
+            self.disclaimer_started = tick
+        t = min(1, max(0, (tick-self.disclaimer_started)/INTRO_FADE_SECONDS))
+        opacity = t*t*(3-2*t)
+        if self.disclaimer_leaving is not None:
+            t = min(1, max(0, (tick-self.disclaimer_leaving)/OUTRO_FADE_SECONDS))
+            opacity = 1-t*t*(3-2*t)
+            if t >= 1:
+                self.disclaimer = False
+                self.opening_started = tick
+                self.layout_key = None
+                self.last_gate = None
+                return self.render(tick)
+        width, height, left, top, x, y, text_width, capacity, framed, lines = self.disclaimer_layout()
+        signature = (self.layout_key, self.disclaimer_offset, opacity)
+        if signature == self.disclaimer_signature and not redraw:
+            return
+        self.disclaimer_signature = signature
+        # Konsole can discard SIXEL rows when native text on them changes.
+        # Restore the cached frame with each page as well as each fade step.
+        if framed and self.art:
+            frame_key = ("disclaimer-frame", width, height)
+            frame = self.art.disclaimer_frame.resize((width, height), Image.Resampling.LANCZOS) if frame_key not in self.static else None
+            parts.append(self.fade_image(frame, top, left, opacity, frame_key))
+        visible = lines[self.disclaimer_offset:self.disclaimer_offset+capacity]
+        for i in range(capacity):
+            value = visible[i] if i < len(visible) else ""
+            color = GOLD if self.disclaimer_offset+i == 0 else INK
+            rgb = ";".join(str(round(c*opacity)) for c in color)
+            parts.append(f"{ESC}[{y+i};{x}H{ESC}[48;2;0;0;0m{ESC}[38;2;{rgb}m{value:<{text_width}}{ESC}[0m")
+        hint = "Enter: continue" if self.disclaimer_last else "Enter: next page"
+        hint += " / Up: back / Q: abort"
+        hint = hint[:text_width]
+        rgb = ";".join(str(round(c*opacity)) for c in MUTED)
+        parts.append(f"{ESC}[{y+capacity+1};{x}H{ESC}[48;2;0;0;0m{ESC}[38;2;{rgb}m{hint:<{text_width}}{ESC}[0m")
+        self.send("".join(parts))
+        if opacity == 1 and self.disclaimer_leaving is None:
+            self.reading_ready(self.disclaimer_last)
 
     def prepare_motion(self, banner):
         key = banner.size
@@ -711,6 +827,8 @@ class Screen:
         parts = []
         if redraw:
             parts.append(f"{ESC}[48;2;{BG[0]};{BG[1]};{BG[2]}m{ESC}[2J{ESC}[H")
+        if self.disclaimer:
+            return self.render_disclaimer(tick, redraw, parts)
         if self.rows < 12 or self.cols < 32:
             self.transition_started = self.motion_started = None
             self.bar_reveal_started = None
@@ -718,6 +836,8 @@ class Screen:
             parts.append(self.text(min(self.rows, 5), self.detail or "Resize the window for artwork", MUTED))
             if self.gate:
                 parts.append(self.text(min(self.rows, 7), "Enter: continue   Q: cancel"))
+                if self.opening_started is not None:
+                    self.opening_started = None
             self.send("".join(parts))
             self.mark_ready()
             return
@@ -735,6 +855,14 @@ class Screen:
         bar_rows = math.ceil(bar_height/self.ch)
         gate_top = 2
         top = gate_top if self.gate or self.transition_started is not None else gate_top + drop
+        banner_reveal = words_reveal = 1
+        opening = self.gate and self.opening_started is not None
+        if opening:
+            elapsed = max(0, tick-self.opening_started)
+            t = min(1, elapsed/INTRO_FADE_SECONDS)
+            banner_reveal = t*t*(3-2*t)
+            t = min(1, max(0, (elapsed-INTRO_FADE_SECONDS)/MENU_FADE_SECONDS))
+            words_reveal = t*t*(3-2*t)
         if self.art:
             banner, _, _, _ = self.art.fit(width, height)
             if self.transition_started is not None:
@@ -744,10 +872,12 @@ class Screen:
                 if self.transition(tick, gate_top, col, drop, gate_top + image_rows + 1, banner):
                     return
                 return self.render(tick)
-            if redraw:
+            if opening and banner_reveal < 1:
+                parts.append(self.fade_image(banner, top, col, banner_reveal, "banner-reveal"))
+            elif redraw or (opening and "banner" not in self.static):
                 parts.append(self.image(banner, top, col, "banner"))
-        elif redraw:
-            parts.append(self.text(top + image_rows // 2, "Z E R O D A Y", GOLD))
+        elif redraw or opening:
+            parts.append(self.text(top + image_rows // 2, "Z E R O D A Y", tuple(round(c*banner_reveal) for c in GOLD)))
         if not self.art and self.transition_started is not None:
             if self.transition(tick, gate_top, col, drop, gate_top + image_rows + 1, None):
                 return
@@ -757,9 +887,12 @@ class Screen:
             for row in range(label_row, self.rows + 1):
                 parts.append(self.text(row, ""))
         if self.gate:
-            if redraw or mode_changed:
-                parts.append(self.gate_words(label_row))
-            parts.append(self.arrow(label_row, tick))
+            if words_reveal > 0:
+                if redraw or mode_changed or opening:
+                    parts.append(self.gate_words(label_row, 1-words_reveal))
+                parts.append(self.arrow(label_row, tick, 1-words_reveal))
+            if opening and words_reveal >= 1:
+                self.opening_started = None
             if self.art and "bar" not in self.static:
                 # Prepare the static ornament once, before the user clicks.
                 # Switching screens then needs no full-picture quantization.
@@ -843,7 +976,7 @@ def main():
         print("\x1f".join((str(cw), str(ch), str(int(graphics)), background,
               "".join(f"\\x{byte:02x}" for byte in pending))))
         return
-    screen = Screen(args.fd, args.assets, max(1, args.cell_width), max(1, args.cell_height), args.sixel, args.ready_file)
+    screen = Screen(args.fd, args.assets, max(1, args.cell_width), max(1, args.cell_height), args.sixel, args.ready_file, intro=True)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
     buffer = b""

@@ -14,6 +14,7 @@ case "${1:-}" in
 esac
 ui_unpack() {
 	cp -- "$UI_SOURCE/renderer.py" "$1/renderer.py"
+	cp -- "$UI_SOURCE/disclaimer.txt" "$1/disclaimer.txt"
 	cp -R -- "$UI_SOURCE/assets" "$1/assets"
 }
 source "$UI_SOURCE/terminal.sh"
