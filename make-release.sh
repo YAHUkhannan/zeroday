@@ -36,6 +36,7 @@ if [ "$SELFTEST" -eq 1 ]; then python3 "$DIST/installer/test_install.py"; fi
 echo "==> packing"
 mkdir -p "$OUT"
 OUT="$(cd "$OUT" && pwd)"
+rm -f "$OUT/zeroday-doctor.sh"
 
 for f in ZeroDay.so library-inject.so steam-jupiter.patched zeroday-repatch.sh zeroday-steam.hook wudrm-proxy.py; do
 	[ -f "$DIST/payload/$f" ] || { echo "missing payload/$f" >&2; exit 1; }
@@ -58,15 +59,7 @@ tar --exclude='__pycache__' --exclude='*.pyc' --exclude='*.pyo' --exclude='*.bak
     payload/wudrm-proxy.py payload/res/config.yaml payload/ZeroDay-plugin
 install -m 0755 "$DIST/install.sh" "$OUT/install.sh"
 
-# Support tool, so a customer can be handed one curl command. Deliberately not
-# part of the payload: the installer never runs it.
-assets="install.sh ZeroDay-payload.tar.gz"
-if [ -f "$DIST/../tools/zeroday-doctor.sh" ]; then
-	install -m 0755 "$DIST/../tools/zeroday-doctor.sh" "$OUT/zeroday-doctor.sh"
-	assets="$assets zeroday-doctor.sh"
-fi
-
-( cd "$OUT" && sha256sum $assets > SHA256SUMS )
+( cd "$OUT" && sha256sum install.sh ZeroDay-payload.tar.gz > SHA256SUMS )
 
 echo
 echo "==> release/ ($TS)"
@@ -75,4 +68,4 @@ echo
 cat "$OUT/SHA256SUMS"
 echo
 echo "Upload these as release assets:"
-echo "  $assets"
+echo "  install.sh ZeroDay-payload.tar.gz SHA256SUMS"
