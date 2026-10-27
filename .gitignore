@@ -1,0 +1,5 @@
+/payload/
+/release*/
+/install.sh
+__pycache__/
+*.py[cod]

@@ -20,10 +20,24 @@
 curl -fsSL https://github.com/YAHUkhannan/zeroday/releases/latest/download/install.sh | bash
 ```
 
-Closes Steam, installs, brings Steam back. No prompts. An existing install is
-picked up rather than replaced — configuration, keys and cache are kept.
+Choose Install on the opening screen. If administrator authentication is needed,
+it happens while Steam is still running. The installer then closes Steam,
+installs ZeroDay and starts Steam again. Existing configuration, keys and ticket
+cache are kept; missing settings are added.
 
-`--uninstall` reverses everything and restores the stock launcher byte for byte.
+Requires Linux x86-64, Python 3, curl and an installed native 64-bit Steam client
+(`steamrt64/steam` and `steamrt64/steamclient.so`). An incompatible client is
+reported before Steam is closed. Pillow enables the artwork; a text interface
+is available without it. The approved preview interface is now the full installer.
+
+Use `--yes` to skip the opening choice, `--no-plugin` to skip Decky changes, or
+`--no-restart` to leave Steam stopped. Administrator authentication may still be
+required with `--yes`.
+
+`--uninstall` removes ZeroDay and restores clean launcher backups when available.
+Your configuration, keys and ticket cache remain. Failed installations restore
+the previous ZeroDay files; if a restore fails, recovery copies are retained
+and their location is printed.
 
 ## Diagnostic logging
 
@@ -34,9 +48,55 @@ copy it before closing Steam if you need the previous session.
 tail -100 ~/.ZeroDay.log | grep -E "License|Pkg|Error|pattern"
 ```
 
-A healthy start looks like `Loaded successfully` and `Hooks: 46 of 46 placed`.
+A healthy start looks like `Loaded successfully` and `Hooks: 41 of 41 placed`.
+
+## Building and testing the installer
+
+The backend is `installer/install.sh.in`; the interface and assets are in
+`installer-ui/`. Generate the standalone installer with:
+
+```sh
+python3 installer-ui/build.py --template installer/install.sh.in --output install.sh
+python3 installer-ui/test_ui.py
+```
+
+To run the isolated installation tests or package a release, first unpack a
+release's `ZeroDay-payload.tar.gz` in the repository root, so `payload/` exists.
+Then run `./make-release.sh --selftest`. The tests use temporary home directories,
+launcher paths and service stubs. They do not change the running Steam install.
+Native libraries and the Decky plugin are distributed in release assets.
 
 ## Changelog
+
+### 1.1.8
+
+- Native 64-bit Steam support, including the configured-app depot ownership check.
+  New installs enable downloads; upgrades preserve existing choices.
+- Fixed the process-inspection exception that could close Steam and a game
+  together when Linux denies access to a process's executable or environment.
+- Cached launch tickets are applied immediately. A provider refresh runs on the
+  existing background queue, removing the fixed six-second launch wait.
+- Removed redundant ticket observer threads and a second concurrent fetch path.
+  Release builds skip debug counters, timing and verbose diagnostic formatting.
+- Disabled API and Lua features no longer start their watchers or Lua VM.
+  Enabling, disabling and reloading them applies on the client thread; internal
+  install commands continue to work when the external API is disabled.
+- The approved animated installer now performs the full installation. Downloads
+  are verified before changes, library replacement uses a new inode, and failed
+  installations restore previous files. Recovery copies survive a failed restore.
+- Launcher repair upgrades older audit exports and selects the matching 64-bit
+  client. Desktop launches keep desktop arguments, zombies do not block startup,
+  and shutdown does not start a second forwarding client.
+- `--no-plugin` preserves all plugin directories. Proxy updates restart the
+  service. Uninstall selects clean backups and preserves a pre-existing runtime
+  opt-in marker.
+
+### 1.1.7
+
+- Ticket harvesting stops and joins its worker before shutdown destroys its
+  synchronization objects.
+- Removing an added game also removes its library tile.
+- Newly configured packages are applied on reload.
 
 ### 1.1.6
 

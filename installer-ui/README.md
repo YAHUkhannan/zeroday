@@ -1,4 +1,4 @@
-# ZeroDay installer interface preview
+# ZeroDay installer interface
 
 The interface keeps the original installer's black canvas, muted text, verse and bouncing selection arrow. It uses the supplied ZeroDay banner and serpent-and-dove progress artwork, with transparent PNG copies composited onto black. The downloaded originals remain byte for byte intact. The filling track uses the original reference image's gold texture, with a subtle moving glint.
 
@@ -28,7 +28,7 @@ The supplied audio cues play asynchronously: `move.wav` when the selected option
 
 Requirements: Bash, Python 3 and curl. Pillow (`python3-pillow` on many distributions) enables the artwork; without it, the progress bar works in text. SIXEL terminals display detailed images, and other UTF-8 truecolor terminals use half-block artwork. The RGBA display assets are `assets/zeroday-banner-transparent.png` and `assets/zeroday-progress-transparent.png`; the original PNGs are retained beside them. Audio lives in `assets/sounds/`.
 
-This package contains the interface, assets and download-preview utility. It contains no installation backend, Steam hooks or mod libraries.
+The interface is used by the full installer generated from `installer/install.sh.in`. The standalone preview runs only the interface and never installs Steam hooks or mod libraries. Run `python3 installer-ui/build.py --template installer/install.sh.in --output install.sh` from the repository root to generate the complete installer.
 
 Run the offline tests, including local HTTP transfers and pseudo-terminal checks:
 

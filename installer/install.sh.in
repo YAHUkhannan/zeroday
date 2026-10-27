@@ -1,0 +1,1363 @@
+#!/usr/bin/env bash
+#
+# ZeroDay installer
+#
+#   curl -fsSL https://github.com/YAHUkhannan/zeroday/releases/latest/download/install.sh | bash
+#
+# What it does, in order:
+#   1. works out what kind of machine this is (SteamOS / Bazzite / CachyOS / Arch / other)
+#   2. downloads the payload and verifies its checksum
+#   3. CLOSES STEAM and waits for it to actually be gone
+#   4. installs the libraries, merges the config, patches the launcher, installs the Decky plugin
+#   5. starts Steam again
+#
+# After that there is nothing to configure: open the store and grab a game.
+#
+# Flags:
+#   --preview        preview the artwork without installing anything
+#   --preview-url U  preview with a real download (no installation)
+#   --local DIR      install from an unpacked payload directory (no download)
+#   --repo URL       override the release base URL
+#   --uninstall      remove ZeroDay AND restore the stock launcher + Steam config
+#   --no-plugin      skip the Decky plugin
+#   --no-restart     leave Steam stopped when we are done
+#   --yes            skip the interactive screen
+#   -h, --help       this text
+#
+# Notes for whoever reads this next:
+#   * The launcher we ship uses $HOME, never a hardcoded home directory, so the
+#     same file is correct on every machine.
+#   * We always back the stock launcher up before replacing it, and we put it
+#     back if anything in this script fails part way through.
+#   * Every step is idempotent. Running it twice is safe.
+#   * On a terminal the script draws its own screen and reads the keyboard from
+#     /dev/tty, so `curl | bash` can still ask. --yes skips that screen.
+
+set -euo pipefail
+
+# --------------------------------------------------------------------- config
+# Release base URL. Override with --repo or ZERODAY_REPO.
+ZERODAY_REPO="${ZERODAY_REPO:-https://github.com/YAHUkhannan/zeroday/releases/latest/download}"
+PAYLOAD_NAME="ZeroDay-payload.tar.gz"
+SUMS_NAME="SHA256SUMS"
+
+ZERODAY_DIR="$HOME/.local/share/ZeroDay"
+ZERODAY_LIB="$ZERODAY_DIR/ZeroDay.so"
+ZERODAY_INJECT="$ZERODAY_DIR/library-inject.so"
+ZERODAY_LOG="$ZERODAY_DIR/install.log"
+CONFIG_DIR="$HOME/.config/ZeroDay"
+CONFIG_FILE="$CONFIG_DIR/config.yaml"
+
+# System paths. Overridable so the whole script can be exercised against a
+# sandbox instead of the real machine — see make-release.sh's --selftest.
+JUPITER="${ZERODAY_JUPITER:-/usr/bin/steam-jupiter}"
+JUPITER_CANON="${ZERODAY_JUPITER_CANON:-/usr/local/share/zeroday/steam-jupiter.patched}"
+BIN_STEAM="${ZERODAY_BIN_STEAM:-/usr/lib/steam/bin_steam.sh}"
+REPATCH_DST="${ZERODAY_REPATCH_DST:-/usr/local/bin/zeroday-repatch.sh}"
+HOOK_DST="${ZERODAY_HOOK_DST:-/etc/pacman.d/hooks/zeroday-steam.hook}"
+
+AUDIT_LINE='export LD_AUDIT="$HOME/.local/share/ZeroDay/library-inject.so:$HOME/.local/share/ZeroDay/ZeroDay.so"; export STEAM_FORCE_CLIENT=steamrt64'
+
+DECKY_PLUGINS="${ZERODAY_DECKY_PLUGINS:-$HOME/homebrew/plugins}"
+DECKY_PLUGIN_NAME="ZeroDay"
+DECKY_INSTALLER_URL="${ZERODAY_DECKY_INSTALLER:-https://github.com/SteamDeckHomebrew/decky-installer/releases/latest/download/install_release.sh}"
+
+# Manifest-request-code proxy. The payload ships the script, a user unit runs it,
+# and the config template points MrcServer at it. MRC_FALLBACK is the public
+# provider used instead when the proxy cannot run here, because a config that
+# points at a closed local port is worse than no proxy at all.
+MRC_LOCAL="http://127.0.0.1:9080/manifest/"
+MRC_FALLBACK="http://gmrc.wudrm.com/manifest/"
+PROXY_OK=0
+
+TS="$(date +%Y%m%d-%H%M%S)-$$"
+
+# ------------------------------------------------------------------- usage
+# Embedded on purpose. When we run as `curl … | bash`, $0 is just "bash", so we
+# cannot re-read our own header off disk.
+usage() {
+	cat <<-'EOF'
+		ZeroDay installer
+
+		  curl -fsSL <install.sh url> | bash
+		  curl -fsSL <install.sh url> | bash -s -- --no-restart
+
+		Flags:
+		  --preview        preview without installing anything
+		  --preview-url U  preview with a real download
+		  --local DIR      install from an unpacked payload directory (no download)
+		  --repo URL       override the release base URL
+		  --uninstall      remove ZeroDay and restore the stock launcher
+		  --no-plugin      skip the Decky plugin
+		  --no-restart     leave Steam stopped when finished
+		  --yes, -y        never prompt
+		  -h, --help       this text
+
+		It closes Steam first, installs everything, then starts Steam again.
+		After that there is nothing to configure — open the store and grab a game.
+	EOF
+}
+
+# ------------------------------------------------------------------- options
+OPT_PREVIEW=0
+OPT_PREVIEW_URL=""
+OPT_LOCAL=""
+OPT_UNINSTALL=0
+OPT_PLUGIN=1
+OPT_RESTART=1
+OPT_YES=0
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--preview) OPT_PREVIEW=1; shift ;;
+		--preview-url) [ -n "${2:-}" ] || { echo "--preview-url needs a URL" >&2; exit 2; }; OPT_PREVIEW=1; OPT_PREVIEW_URL=$2; shift 2 ;;
+		--local) [ -n "${2:-}" ] || { echo "--local needs a directory" >&2; exit 2; }; OPT_LOCAL=$2; shift 2 ;;
+		--repo) [ -n "${2:-}" ] || { echo "--repo needs a URL" >&2; exit 2; }; ZERODAY_REPO=$2; shift 2 ;;
+		--uninstall) OPT_UNINSTALL=1; shift ;;
+		--no-plugin) OPT_PLUGIN=0; shift ;;
+		--no-restart) OPT_RESTART=0; shift ;;
+		--yes|-y) OPT_YES=1; shift ;;
+		-h|--help) usage; exit 0 ;;
+		*) echo "unknown flag: $1" >&2; exit 2 ;;
+	esac
+done
+
+
+
+# @ZERODAY_UI@
+
+ui_floor_step() {
+	local n=0
+	case "$1" in
+		"Fetching the payload") n=80 ;;
+		"Closing Steam") n=560 ;;
+		"Migrating your existing SLSsteam install") n=640 ;;
+		"Installing libraries") n=700 ;;
+		"Config") n=740 ;;
+		"Manifest-code proxy") n=780 ;;
+		Making\ *) n=810 ;;
+		"Patching the Steam launcher") n=830 ;;
+		"Patching bin_steam.sh") n=855 ;;
+		"Installing the re-patch hook") n=875 ;;
+		"Blocking Steam client updates") n=895 ;;
+		"Decky Loader") n=920 ;;
+		"Removing previous plugin builds") n=945 ;;
+		"Installing the Decky plugin") n=965 ;;
+		"Starting Steam") n=985 ;;
+		"Uninstalling ZeroDay") n=200 ;;
+		"Uninstalled"|"Done") n=1000 ;;
+		*) n=$((UI_PCT + 8)) ;;
+	esac
+	if [ "$n" -gt 1000 ]; then
+		n=1000
+	fi
+	if [ "$n" -gt "$UI_PCT" ]; then
+		UI_PCT=$n
+	fi
+}
+
+
+to_log() { printf '%s\n' "$*" >> "$ZERODAY_LOG" 2>/dev/null || true; }
+
+log() {
+	to_log "$*"
+	if [ "$INTERACTIVE" -eq 1 ] && [ "$UI_LIVE" -eq 1 ]; then ui_push log "$*"
+	elif [ "$INTERACTIVE" -eq 0 ]; then printf '%s\n' "$*"
+	fi
+}
+ok() {
+	to_log "[ok] $*"
+	if [ "$INTERACTIVE" -eq 1 ] && [ "$UI_LIVE" -eq 1 ]; then ui_push ok "$*"
+	elif [ "$INTERACTIVE" -eq 0 ]; then printf '%s  ok  %s%s\n' "$c_ok" "$c_reset" "$*"
+	fi
+}
+warn() {
+	to_log "[warn] $*"
+	if [ "$INTERACTIVE" -eq 1 ] && [ "$UI_LIVE" -eq 1 ]; then ui_push warn "$*"
+	elif [ "$INTERACTIVE" -eq 0 ]; then printf '%s  !!  %s%s\n' "$c_warn" "$c_reset" "$*"
+	fi
+}
+step() {
+	to_log "==> $*"
+	if [ "$INTERACTIVE" -eq 1 ] && [ "$UI_LIVE" -eq 1 ]; then
+		case "$*" in
+			Done) UI_PHASE="ready" ;;
+			Uninstalled) UI_PHASE="removed" ;;
+			*) UI_PHASE=$(printf '%s' "$*" | tr '[:upper:]' '[:lower:]') ;;
+		esac
+		ui_floor_step "$*"
+		ui_draw_progress
+	elif [ "$INTERACTIVE" -eq 0 ]; then
+		printf '\n%s==> %s%s\n' "$c_dim" "$*" "$c_reset"
+	fi
+}
+die()  {
+	to_log "[fail] $*"
+	if [ "$INTERACTIVE" -eq 1 ]; then
+		if [ "$UI_LIVE" -eq 1 ]; then
+			ui_push fail "$*"
+			sleep 1
+		fi
+		ui_restore
+	fi
+	printf '%s fail %s%s\n' "$c_err" "$c_reset" "$*" >&2
+	exit 1
+}
+
+SUDO=""
+init_sudo() {
+	if [ "${ZERODAY_NO_SUDO:-0}" = "1" ]; then SUDO=""; return 0; fi
+	if [ "$(id -u)" -eq 0 ]; then SUDO=""; return 0; fi
+	if command -v sudo >/dev/null 2>&1; then SUDO="sudo"
+	else die "need root for the launcher patch, and sudo is not installed"
+	fi
+}
+
+# Ask for the password BEFORE anything is closed, and keep the ticket warm.
+#
+# On a Steam Deck in Game Mode the on-screen keyboard belongs to the Steam
+# session. Steam is stopped partway through this install, so a password prompt
+# that appears after that point cannot be answered at all: the keyboard is gone
+# and the install sits there until it times out. Every prompt is therefore taken
+# up front, while Steam is still running, and refreshed so the later privileged
+# steps do not ask again with nothing left to type on.
+prime_sudo() {
+	[ -n "$SUDO" ] || return 0
+
+	if $SUDO -n true 2>/dev/null; then
+		return 0
+	fi
+
+	# sudo reads stdin. Under `curl | bash` that stdin is the installer, so the
+	# password has to come from the terminal. Ask now, while Steam is still up
+	# and the on-screen keyboard still exists.
+	if [ "$INTERACTIVE" -eq 1 ]; then
+		UI_WORK=0
+		ui_pause
+		[ -n "$UI_SAVED_STTY" ] && stty "$UI_SAVED_STTY" <&"$UI_FD" 2>/dev/null || true
+		ui '\033[48;2;0;0;0m\033[38;2;108;108;108m\033[2J\033[H\033[?25h'
+		ui '  ZERODAY  //  administrator\n\n'
+		ui '  Steam is still running, so the on-screen keyboard works.\n'
+		ui '  This password is for the launcher patch. It is not asked again.\n\n'
+		$SUDO -v <&"$UI_FD" || die "could not authenticate with sudo"
+		stty -echo -icanon min 1 time 0 <&"$UI_FD" 2>/dev/null || true
+		ui_draw_progress
+	else
+		printf '\n%s\n%s\n%s\n\n' \
+			"  ZeroDay needs administrator rights for the launcher patch." \
+			"  Enter your password now, while Steam is still running and the" \
+			"  on-screen keyboard is available. It will not be asked again."
+		if [ -r /dev/tty ]; then
+			$SUDO -v </dev/tty || die "could not authenticate with sudo"
+		else
+			$SUDO -v || die "could not authenticate with sudo"
+		fi
+	fi
+}
+
+asroot() { if [ -n "$SUDO" ]; then "$SUDO" "$@"; else "$@"; fi; }
+
+# SteamOS keeps /usr on a read-only image, and every file this installer has to
+# touch lives there: the launcher, bin_steam.sh and the re-patch script. Without
+# this, a Deck install dies at the first copy. It is deliberately left disabled:
+# a SteamOS image update puts the stock launcher back, and the login-time re-patch
+# has to be able to write these same files again when that happens.
+system_writable() {
+	local probe="$1/.zeroday-write-probe.$$"
+	if asroot touch "$probe" 2>/dev/null; then
+		asroot rm -f "$probe" 2>/dev/null
+		return 0
+	fi
+	return 1
+}
+
+ensure_system_writable() {
+	local dir
+	dir="$(dirname "$JUPITER")"
+
+	if system_writable "$dir"; then
+		return 0
+	fi
+
+	if ! command -v steamos-readonly >/dev/null 2>&1; then
+		die "$dir is read-only and steamos-readonly is not available"
+	fi
+
+	step "Making $dir writable (SteamOS)"
+	asroot steamos-readonly disable >/dev/null 2>&1 || true
+
+	if system_writable "$dir"; then
+		ok "/usr is writable (steamos-readonly left disabled so re-patching works)"
+		warn "run 'sudo steamos-readonly enable' yourself if you want the image locked again"
+	else
+		die "$dir is still read-only — run 'sudo steamos-readonly disable' and re-run"
+	fi
+}
+
+
+
+# --------------------------------------------------------------- fail-safety
+JUPITER_BAK=""
+PATCHED_JUPITER=0
+TX_DIR=""
+TX_ACTIVE=0
+WORK_OWNED=0
+declare -a TX_PATHS=() TX_PRESENT=()
+
+track_path() {
+	local path="$1" index=${#TX_PATHS[@]}
+	TX_PATHS+=("$path")
+	if asroot test -e "$path" || asroot test -L "$path"; then
+		TX_PRESENT+=(1)
+		asroot cp -a -- "$path" "$TX_DIR/$index" || die "could not save $path before installation"
+	else
+		TX_PRESENT+=(0)
+	fi
+}
+
+begin_transaction() {
+	TX_DIR=$(mktemp -d "$ZERODAY_DIR/.transaction.XXXXXXXX")
+	local path name
+	for path in "$ZERODAY_LIB" "$ZERODAY_INJECT" "$ZERODAY_DIR/wudrm-proxy.py" \
+		"$CONFIG_DIR" "$JUPITER" "$JUPITER_CANON" "$BIN_STEAM" "$REPATCH_DST" "$HOOK_DST" \
+		"$STEAM_ROOT/.steam-enable-steamrt64-client" "$ZERODAY_DIR/created-steamrt64-marker" \
+		"$HOME/.config/systemd/user/zeroday-repatch.service" \
+		"$HOME/.config/systemd/user/zeroday-mrc-proxy.service" \
+		"$HOME/.config/systemd/user/default.target.wants/zeroday-mrc-proxy.service" \
+		"$HOME/.config/systemd/user/graphical-session.target.wants/zeroday-repatch.service" \
+		"$HOME/.local/share/SLSsteam" "$HOME/.config/SLSsteam"; do
+		track_path "$path"
+	done
+	for path in "$HOME/.steam/steam" "$HOME/.local/share/Steam"; do
+		[ ! -d "$path" ] || track_path "$path/steam.cfg"
+	done
+	if [ "$OPT_PLUGIN" -eq 1 ]; then
+		for name in "$DECKY_PLUGIN_NAME" $PREVIOUS_PLUGIN_DIRS; do
+			track_path "$DECKY_PLUGINS/$name"
+		done
+	fi
+	if [ -n "$SUDO" ]; then track_path /etc/sudoers.d/zeroday-repatch; fi
+	TX_ACTIVE=1
+}
+
+cleanup_on_failure() {
+	local rc=$? index path restore_failed=0
+	trap - EXIT
+	set +e
+	ui_restore
+	if [ "$TX_ACTIVE" -eq 1 ] && [ "$rc" -ne 0 ]; then
+		printf '%s\n' 'Installation failed; restoring the previous files.' >&2
+		for ((index=${#TX_PATHS[@]}-1; index>=0; index--)); do
+			path=${TX_PATHS[index]}
+			asroot rm -rf -- "$path" || { restore_failed=1; continue; }
+			if [ "${TX_PRESENT[index]}" -eq 1 ]; then
+				asroot mkdir -p -- "$(dirname "$path")" &&
+					asroot cp -a -- "$TX_DIR/$index" "$path" || restore_failed=1
+			fi
+		done
+		# The service may already have been restarted with the new proxy.
+		if command -v systemctl >/dev/null 2>&1; then
+			systemctl --user daemon-reload >/dev/null 2>&1 || true
+			if [ -f "$HOME/.config/systemd/user/zeroday-mrc-proxy.service" ]; then
+				systemctl --user restart zeroday-mrc-proxy.service >/dev/null 2>&1 || true
+			else
+				systemctl --user stop zeroday-mrc-proxy.service >/dev/null 2>&1 || true
+			fi
+		fi
+	fi
+	if [ "$restore_failed" -eq 1 ]; then
+		printf 'Some files could not be restored. Recovery copies are kept at: %s\n' "$TX_DIR" >&2
+	else
+		[ -z "$TX_DIR" ] || asroot rm -rf -- "$TX_DIR" || true
+	fi
+	if [ "$WORK_OWNED" -eq 1 ] && [ -n "$WORK" ]; then rm -rf -- "$WORK"; fi
+	if [ "$rc" -ne 0 ]; then printf 'Installation failed (exit %s). Log: %s\n' "$rc" "$ZERODAY_LOG" >&2; fi
+	exit "$rc"
+}
+
+# ------------------------------------------------------------------ distro
+DISTRO=""; DISTRO_LIKE=""; FAMILY="other"
+detect_distro() {
+	local f
+	for f in /etc/os-release /usr/lib/os-release; do
+		[ -r "$f" ] || continue
+		# shellcheck disable=SC1090
+		. "$f"
+		break
+	done
+	DISTRO="${ID:-}"; DISTRO_LIKE="${ID_LIKE:-}"
+	case " $DISTRO $DISTRO_LIKE " in
+		*" steamos "*)           FAMILY="steamos" ;;
+		*" bazzite "*)           FAMILY="bazzite" ;;
+		*" cachyos "*)           FAMILY="cachyos" ;;
+		*" arch "*)              FAMILY="arch" ;;
+		*" debian "*|*" ubuntu "*) FAMILY="debian" ;;
+		*" fedora "*)            FAMILY="fedora" ;;
+		*)                       FAMILY="other" ;;
+	esac
+	log "distro: ${DISTRO:-unknown} (like: ${DISTRO_LIKE:-none}) -> family: $FAMILY"
+}
+
+# ------------------------------------------------------------------- steam
+STEAM_ROOT=""
+find_steam_root() {
+	local c
+	for c in "$HOME/.steam/steam" "$HOME/.local/share/Steam" \
+	         "$HOME/.var/app/com.valvesoftware.Steam/.local/share/Steam"; do
+		[ -d "$c" ] && { STEAM_ROOT="$c"; break; }
+	done
+	[ -n "$STEAM_ROOT" ] || die "could not find a Steam install under \$HOME"
+	log "steam root: $STEAM_ROOT"
+}
+
+# A zombie still matches `pgrep -x steam`. Treating it as a live client makes
+# the installer wait, fail to kill a process that is already dead, and abort.
+steam_pids() {
+	local pid stat
+	for pid in $(pgrep -A -u "$(id -u)" -x steam 2>/dev/null || true); do
+		stat=$(ps -o stat= -p "$pid" 2>/dev/null | tr -d '[:space:]')
+		case "$stat" in
+			Z*|"") ;;
+			*) printf '%s\n' "$pid" ;;
+		esac
+	done
+}
+
+steam_running() { [ -n "$(steam_pids)" ]; }
+
+stop_steam() {
+	step "Closing Steam"
+	if ! steam_running; then ok "Steam is not running"; return 0; fi
+
+	# Last call for the password, while the on-screen keyboard still exists. A
+	# ticket primed up front can expire during a long payload fetch, and a prompt
+	# after this point would be unanswerable on a Deck in Game Mode.
+	if [ -n "$SUDO" ] && ! $SUDO -n true 2>/dev/null; then
+		warn "administrator rights are needed again before Steam is closed"
+		prime_sudo
+	fi
+
+	# Do not run `steam -shutdown` or `steam.sh -shutdown`. That starts a second
+	# client, and the one already running dies in
+	# SteamBootstrapper_GetForwardedCommandLine. SIGTERM is the quit that runs
+	# the client's own cleanup. Exact pids only, so this script is not matched.
+	local pid i=0
+	for pid in $(steam_pids); do
+		kill -TERM "$pid" 2>/dev/null || true
+	done
+
+	while [ "$i" -lt 25 ] && steam_running; do
+		sleep 1; i=$((i + 1))
+		if [ "$INTERACTIVE" -eq 1 ]; then
+			UI_PHASE="waiting for steam  ${i}s"
+			if [ "$UI_PCT" -lt 630 ]; then
+				UI_PCT=$((UI_PCT + 2))
+			fi
+			ui_draw_progress
+		else
+			printf '\r%s  waiting for Steam to exit… %ss%s' "$c_dim" "$i" "$c_reset"
+		fi
+	done
+	[ "$INTERACTIVE" -eq 0 ] && [ "$i" -gt 0 ] && printf '\n'
+
+	if steam_running; then
+		warn "Steam is still up — sending KILL"
+		for pid in $(steam_pids); do
+			kill -KILL "$pid" 2>/dev/null || true
+		done
+		pkill -u "$(id -u)" -x -KILL steamwebhelper 2>/dev/null || true
+		sleep 2
+	fi
+
+	steam_running && die "could not stop Steam — close it manually and re-run"
+	ok "Steam is closed"
+}
+
+start_steam() {
+	[ "$OPT_RESTART" -eq 1 ] || { warn "leaving Steam stopped (--no-restart)"; return 0; }
+
+	# On a handheld in Game Mode the session manager owns the client. Starting
+	# our own copy here would fight it, so hand it back to the session instead.
+	if pgrep -x gamescope >/dev/null 2>&1; then
+		warn "Game Mode (gamescope) is running — not launching Steam from here"
+		warn "return to Game Mode (or log out and back in) and Steam will come up"
+		return 0
+	fi
+
+	step "Starting Steam"
+	# Game Mode is handled above. Desktop launches use the regular desktop
+	# arguments; the patched Jupiter adds -steamdeck only for -gamepadui.
+	if [ -x "$HOME/.local/bin/steam-desktop" ]; then
+		nohup "$HOME/.local/bin/steam-desktop" -silent >/dev/null 2>&1 8>&- &
+		ok "launched via steam-desktop"
+	elif [ "$FAMILY" = "steamos" ] || [ "$FAMILY" = "bazzite" ]; then
+		if [ -x "$JUPITER" ]; then
+			nohup "$JUPITER" >/dev/null 2>&1 8>&- &
+			ok "launched via $JUPITER"
+		elif command -v steam >/dev/null 2>&1; then
+			nohup steam >/dev/null 2>&1 8>&- &
+			ok "launched via steam"
+		else
+			warn "no launcher found — start Steam yourself"
+		fi
+	elif [ -x /usr/lib/steam/steam ]; then
+		nohup /usr/lib/steam/steam >/dev/null 2>&1 8>&- &
+		ok "launched via /usr/lib/steam/steam"
+	elif command -v steam >/dev/null 2>&1; then
+		nohup steam >/dev/null 2>&1 8>&- &
+		ok "launched via steam"
+	else
+		warn "no launcher found — start Steam yourself"
+	fi
+}
+
+# ------------------------------------------------------------------ payload
+WORK=""
+fetch_payload() {
+	step "Fetching the payload"
+	if [ -n "$OPT_LOCAL" ]; then
+		[ -d "$OPT_LOCAL" ] || die "--local directory not found: $OPT_LOCAL"
+		WORK="$OPT_LOCAL"
+		ok "using local payload: $WORK"
+	else
+		command -v curl >/dev/null 2>&1 || die "curl is required"
+		WORK="$(mktemp -d)"
+		WORK_OWNED=1
+		local tgz="$WORK/$PAYLOAD_NAME" sums="$WORK/$SUMS_NAME"
+
+		ui_fetch "$tgz" "$ZERODAY_REPO/$PAYLOAD_NAME" "$UI_PCT" 470 \
+			|| die "download failed: $ZERODAY_REPO/$PAYLOAD_NAME"
+		ui_fetch "$sums" "$ZERODAY_REPO/$SUMS_NAME" "$UI_PCT" 520 \
+			|| die "download failed: $ZERODAY_REPO/$SUMS_NAME"
+
+		# Verify before we touch anything. A bad tarball must never be unpacked.
+		local want got
+		want="$(awk -v f="$PAYLOAD_NAME" '$2==f || $2=="*"f {print $1}' "$sums" | head -1)"
+		[ -n "$want" ] || die "$SUMS_NAME has no entry for $PAYLOAD_NAME"
+		got="$(sha256sum "$tgz" | awk '{print $1}')"
+		[ "$want" = "$got" ] || die "checksum mismatch: expected $want, got $got"
+		ok "checksum verified (${got:0:16}…)"
+
+		tar -xzf "$tgz" -C "$WORK" || die "could not unpack $PAYLOAD_NAME"
+		rm -f "$tgz" "$sums"
+		ok "unpacked to $WORK"
+	fi
+
+	for f in ZeroDay.so library-inject.so steam-jupiter.patched; do
+		[ -f "$WORK/payload/$f" ] || die "payload is missing $f"
+	done
+	if [ "$INTERACTIVE" -eq 1 ] && [ "$UI_LIVE" -eq 1 ] && [ "$UI_PCT" -lt 540 ]; then
+		UI_PCT=540
+	fi
+	ok "payload looks complete"
+}
+
+# ------------------------------------------------------------- migration ----
+# Take over from a previous SLSsteam (or older ZeroDay) install.
+#
+# The old *libraries* must go: they are the other half of the same LD_AUDIT, and
+# two of them fighting over steamclient.so is how you get a client that will not
+# boot. The old *state* must stay, because that is the part the user cannot get
+# back:
+#
+#   config.yaml     every game they have injected. Losing it means re-adding all
+#                   of them by hand.
+#   depotkeys.json  the key vault. ZeroDay historically symlinked its copy into
+#                   the SLSsteam directory, so removing that directory without
+#                   rescuing the target leaves a dangling symlink and no vault.
+#   cache/          the ticket cache. Regenerable, but only by launching every
+#                   game once.
+#
+# So: rescue first, then delete.
+migrate_old_install() {
+	local old_share="$HOME/.local/share/SLSsteam"
+	local old_conf="$HOME/.config/SLSsteam"
+
+	if [ ! -d "$old_share" ] && [ ! -d "$old_conf" ]; then
+		return 0
+	fi
+
+	step "Migrating your existing SLSsteam install"
+	mkdir -p "$CONFIG_DIR"
+
+	# 1. The vault symlink first. Everything else can be regenerated; this
+	#    cannot.
+	local zd_keys="$CONFIG_DIR/depotkeys.json"
+	if [ -L "$zd_keys" ]; then
+		local target; target="$(readlink -f "$zd_keys" 2>/dev/null || true)"
+		case "$target" in
+			"$old_conf"/*)
+				if [ -f "$target" ]; then
+					cp -p "$target" "$zd_keys.rescue-$TS"
+					rm -f "$zd_keys"
+					mv -f "$zd_keys.rescue-$TS" "$zd_keys"
+					ok "key vault was a symlink into SLSsteam — replaced it with a real copy"
+				else
+					warn "depotkeys.json pointed into SLSsteam but the target is gone"
+				fi ;;
+		esac
+	fi
+
+	# 2. The config. Adopt theirs only if we have not got one — if both exist,
+	#    ours is the live one and theirs is context, not truth.
+	if [ -f "$old_conf/config.yaml" ]; then
+		if [ ! -f "$CONFIG_FILE" ]; then
+			cp -p "$old_conf/config.yaml" "$CONFIG_FILE"
+			ok "adopted your SLSsteam config.yaml — your injected games are kept"
+		else
+			cp -p "$old_conf/config.yaml" "$CONFIG_DIR/slssteam-config.yaml.bak-$TS"
+			ok "kept your ZeroDay config.yaml (old one saved as slssteam-config.yaml.bak-$TS)"
+		fi
+	fi
+
+	# 3. Anything else ZeroDay reads, if we have not got it yet.
+	local f
+	for f in depotkeys.json manifestcodes.json; do
+		if [ ! -e "$CONFIG_DIR/$f" ] && [ -f "$old_conf/$f" ]; then
+			cp -p "$old_conf/$f" "$CONFIG_DIR/$f"
+			ok "carried over $f"
+		fi
+	done
+
+	local d
+	for d in cache plugins; do
+		if [ ! -d "$CONFIG_DIR/$d" ] && [ -d "$old_conf/$d" ]; then
+			cp -a "$old_conf/$d" "$CONFIG_DIR/$d"
+			ok "carried over $d/"
+		fi
+	done
+
+	# 4. Now the old install goes. Keep a copy of the whole thing first — it is
+	#    small next to the keys, and it is the difference between an annoyed
+	#    user and an unrecoverable one.
+	if [ -d "$old_conf" ]; then
+		local keep="$ZERODAY_DIR/slssteam-backup-$TS"
+		mkdir -p "$keep"
+		cp -a "$old_conf" "$keep/" 2>/dev/null || true
+		rm -rf "$old_conf"
+		ok "removed ~/.config/SLSsteam (copy kept at $keep)"
+	fi
+	if [ -d "$old_share" ]; then
+		rm -rf "$old_share"
+		ok "removed ~/.local/share/SLSsteam (old libraries)"
+	fi
+}
+
+# ------------------------------------------------------------------ decky ----
+# Decky Loader: use the one that is already there, install it only if missing.
+#
+# An existing Decky must never be replaced, and neither must the plugins and
+# settings that live next to ours: ~/homebrew is the user's, not ours. So the
+# test for "is Decky here" is deliberately generous — a plugin-only install, a
+# hand-built one, or one whose unit has been renamed all count — and the *last*
+# word belongs to ~/homebrew itself: if that directory exists, we do not run
+# Decky's installer over it, whatever the markers say. Worst case the customer
+# is told to install Decky themselves; they never lose the one they have.
+ensure_decky() {
+	step "Decky Loader"
+	if [ -d "$HOME/homebrew/services" ] \
+		|| [ -d "$HOME/homebrew/plugins" ] \
+		|| [ -x "$HOME/homebrew/services/PluginLoader" ] \
+		|| systemctl cat plugin_loader.service >/dev/null 2>&1 \
+		|| pgrep -f "homebrew/services/PluginLoader" >/dev/null 2>&1; then
+		ok "already installed — leaving it alone"
+		return 0
+	fi
+
+	if [ -e "$HOME/homebrew" ]; then
+		warn "$HOME/homebrew exists but has none of Decky's usual pieces"
+		warn "that is not a plain Decky install, so I am leaving it alone"
+		warn "install/repair Decky Loader yourself, then re-run this installer"
+		return 0
+	fi
+
+	warn "Decky Loader is not installed"
+	if ! command -v jq >/dev/null 2>&1; then
+		warn "Decky's own installer needs jq and jq is missing — install Decky yourself"
+		return 0
+	fi
+
+	local dl="$ZERODAY_DIR/decky-installer.sh"
+	if ! ui_fetch "$dl" "$DECKY_INSTALLER_URL" "$UI_PCT" 950; then
+		warn "could not download Decky's installer — install Decky yourself"
+		return 0
+	fi
+
+	# Its first line is `exec sudo "$0"`, and it asks questions. It needs a real
+	# terminal — our stdin may be the script itself, so hand it /dev/tty.
+	if [ -e /dev/tty ]; then
+		# Decky's installer takes the terminal. The work screen is painted again after.
+		if [ "$INTERACTIVE" -eq 1 ]; then
+			UI_WORK=0
+			ui_pause
+		fi
+		if sh "$dl" < /dev/tty > /dev/tty 2>&1; then
+			ok "Decky Loader installed"
+		else
+			warn "Decky's installer did not finish — continuing without it"
+		fi
+	else
+		warn "no terminal available for Decky's installer — install Decky yourself"
+	fi
+	ui_draw_progress
+	rm -f "$dl"
+	return 0
+}
+
+# ------------------------------------------------- remove previous builds ----
+# Directory names this has shipped under before, or that it replaces. Decky
+# keys a plugin off its directory name, so these are what we look for.
+PREVIOUS_PLUGIN_DIRS="Wally-Decky Wally_Decky WallyDecky wally-decky Wally hollow-decky hollow-decky2 Hollow-decky"
+
+remove_previous_plugins() {
+	step "Removing previous plugin builds"
+	if [ ! -d "$DECKY_PLUGINS" ]; then
+		ok "no plugins directory here — nothing to remove"
+		return 0
+	fi
+
+	local n d found=0
+	for n in $PREVIOUS_PLUGIN_DIRS; do
+		d="$DECKY_PLUGINS/$n"
+		[ -d "$d" ] || continue
+		# Keep a copy. Removing a plugin someone deliberately installed should
+		# never be a one-way door.
+		asroot cp -a "$d" "$ZERODAY_DIR/removed-$n-$TS" 2>/dev/null || true
+		asroot rm -rf "$d"
+		ok "removed $n (copy kept in $ZERODAY_DIR)"
+		found=1
+	done
+
+	[ "$found" -eq 0 ] && ok "none present"
+	return 0
+}
+
+# --------------------------------------------------------------- install bits
+install_libs() {
+	step "Installing libraries"
+	mkdir -p "$ZERODAY_DIR"
+	local name staged
+	for name in library-inject.so ZeroDay.so; do
+		staged=$(mktemp "$ZERODAY_DIR/.$name.XXXXXXXX")
+		install -m 0755 "$WORK/payload/$name" "$staged"
+		mv -f -- "$staged" "$ZERODAY_DIR/$name"
+	done
+	ok "64-bit libraries installed"
+}
+
+validate_runtime() {
+	# Refuse an incompatible installation before Steam or any user state is touched.
+	command -v python3 >/dev/null 2>&1 || die "Python 3 is required"
+	python3 - "$WORK/payload/ZeroDay.so" "$WORK/payload/library-inject.so" \
+		"$STEAM_ROOT/steamrt64/steam" "$STEAM_ROOT/steamrt64/steamclient.so" <<'ELF_CHECK' || die "a complete 64-bit Steam client and matching payload are required; update Steam first"
+import struct, sys
+for name in sys.argv[1:]:
+    try:
+        with open(name, 'rb') as f: header = f.read(20)
+        if len(header) != 20 or header[:6] != b'\x7fELF\x02\x01' or struct.unpack_from('<H', header, 18)[0] != 62:
+            raise ValueError('expected x86-64 ELF')
+    except (OSError, ValueError) as error:
+        print(f'{name}: {error}', file=sys.stderr)
+        sys.exit(1)
+ELF_CHECK
+	[ -x "$STEAM_ROOT/steamrt64/steam" ] || die "64-bit Steam is not executable"
+}
+
+select_runtime() {
+	local marker="$STEAM_ROOT/.steam-enable-steamrt64-client"
+	if [ ! -e "$marker" ]; then
+		touch "$marker"
+		printf '%s\n' "$marker" > "$ZERODAY_DIR/created-steamrt64-marker"
+	fi
+}
+
+merge_config() {
+	step "Config"
+	mkdir -p "$CONFIG_DIR"
+	local tmpl="$WORK/payload/res/config.yaml"
+	if [ ! -f "$tmpl" ]; then warn "no config template in payload — leaving config alone"; return 0; fi
+
+	if [ ! -f "$CONFIG_FILE" ]; then
+		install -m 0644 "$tmpl" "$CONFIG_FILE"
+		ok "installed default config"
+		return 0
+	fi
+
+	# Keep every value the user already has; only add keys the template has and
+	# the user's file does not. Same idea as headcrab's config merge, with one
+	# fix: the template drives the output order, so keys the user has that the
+	# template has never heard of would otherwise be dropped silently. Those get
+	# appended at the end instead.
+	local merged; merged="$(mktemp)"
+	awk '
+		NR == FNR {
+			if ($0 ~ /^[A-Za-z_][A-Za-z0-9_]*:/) {
+				key = $0; sub(/:.*/, "", key)
+				current = key; present[key] = 1; saved[key] = $0 ORS
+				if (!(key in seen)) { seen[key] = 1; order[++nkeys] = key }
+				next
+			}
+			if (current != "" && $0 ~ /^[[:space:]]+/) { saved[current] = saved[current] $0 ORS }
+			next
+		}
+		/^[A-Za-z_][A-Za-z0-9_]*:/ {
+			key = $0; sub(/:.*/, "", key)
+			printf "%s", prefix; prefix = ""
+			if (key in present) { printf "%s", saved[key]; use_template = 0; emitted[key] = 1 }
+			else { print; use_template = 1 }
+			have_key = 1; next
+		}
+		have_key && /^[[:space:]]+/ { if (use_template) print; next }
+		{ prefix = prefix $0 ORS }
+		END {
+			printf "%s", prefix
+			for (i = 1; i <= nkeys; i++) {
+				k = order[i]
+				if (!(k in emitted)) printf "%s", saved[k]
+			}
+		}
+	' "$CONFIG_FILE" "$tmpl" > "$merged"
+
+	if cmp -s "$CONFIG_FILE" "$merged"; then
+		rm -f "$merged"; ok "config already up to date"
+	else
+		cp -p "$CONFIG_FILE" "$CONFIG_FILE.bak-$TS"
+		chmod --reference="$CONFIG_FILE" "$merged" 2>/dev/null || true
+		mv -f "$merged" "$CONFIG_FILE"
+		ok "config updated (backup: $CONFIG_FILE.bak-$TS)"
+	fi
+}
+
+# ------------------------------------------------------------------- mrc -----
+# The local manifest-request-code proxy. Steam refuses to issue a code for an app
+# you do not own and without a code every content server answers 401, so the mod
+# asks this one local URL and the proxy tries several public providers in order,
+# retrying the flaky ones and caching what it gets.
+install_mrc_proxy() {
+	step "Manifest-code proxy"
+	local src="$WORK/payload/wudrm-proxy.py"
+	[ -f "$src" ] || { warn "payload has no proxy — leaving MrcServer alone"; return 0; }
+
+	local py; py="$(command -v python3 2>/dev/null || true)"
+	if [ -z "$py" ]; then
+		warn "python3 is not installed — the local proxy cannot run"
+		return 0
+	fi
+
+	install -m 0755 "$src" "$ZERODAY_DIR/wudrm-proxy.py" \
+		|| { warn "could not install the proxy"; return 0; }
+	ok "proxy script installed"
+
+	if ! command -v systemctl >/dev/null 2>&1; then
+		warn "systemctl not found — start it yourself: $py $ZERODAY_DIR/wudrm-proxy.py"
+		return 0
+	fi
+
+	local dir="$HOME/.config/systemd/user"
+	mkdir -p "$dir"
+	cat > "$dir/zeroday-mrc-proxy.service" <<EOF
+[Unit]
+Description=ZeroDay manifest-request-code proxy (multi-provider retry + cache)
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$py $ZERODAY_DIR/wudrm-proxy.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target
+EOF
+	systemctl --user daemon-reload >/dev/null 2>&1 || true
+
+	if ! systemctl --user enable zeroday-mrc-proxy.service >/dev/null 2>&1 ||
+	   ! systemctl --user restart zeroday-mrc-proxy.service >/dev/null 2>&1; then
+		warn "could not enable the proxy service"
+		return 0
+	fi
+
+	# Give it a moment, then believe what the unit says rather than the exit code
+	# of enable: a port already in use or a missing python3 shows up here.
+	local i=0
+	while [ "$i" -lt 5 ]; do
+		systemctl --user is-active --quiet zeroday-mrc-proxy.service && break
+		sleep 1; i=$((i + 1))
+	done
+	if systemctl --user is-active zeroday-mrc-proxy.service >/dev/null 2>&1; then
+		PROXY_OK=1
+		ok "proxy running (127.0.0.1:9080, started at login by zeroday-mrc-proxy.service)"
+	else
+		warn "the proxy service is not active — check: systemctl --user status zeroday-mrc-proxy"
+	fi
+}
+
+# Only when the proxy is not running: a config pointing at a closed 127.0.0.1
+# port would make every code request fail. Rewrite that one key to the public
+# provider — and only if it still holds the value we just wrote, so a user who
+# chose their own server keeps it.
+mrc_fallback_config() {
+	[ "$PROXY_OK" -eq 1 ] && return 0
+	[ -f "$CONFIG_FILE" ] || return 0
+	grep -qxF "MrcServer: $MRC_LOCAL" "$CONFIG_FILE" || return 0
+
+	local tmp; tmp="$(mktemp)"
+	sed "s|^MrcServer: .*|MrcServer: $MRC_FALLBACK|" "$CONFIG_FILE" > "$tmp"
+	cp -p "$CONFIG_FILE" "$CONFIG_FILE.bak-mrc-$TS"
+	chmod --reference="$CONFIG_FILE" "$tmp" 2>/dev/null || true
+	mv -f "$tmp" "$CONFIG_FILE"
+	warn "no local proxy here — MrcServer set to $MRC_FALLBACK instead"
+}
+
+patch_jupiter() {
+	step "Patching the Steam launcher"
+	if [ ! -f "$JUPITER" ]; then
+		warn "$JUPITER not found — this machine does not launch Steam through it"
+		return 1
+	fi
+
+	if cmp -s "$WORK/payload/steam-jupiter.patched" "$JUPITER"; then
+		ok "launcher already current"
+	else
+		JUPITER_BAK="$JUPITER.bak-zeroday-$TS"
+		asroot cp -p "$JUPITER" "$JUPITER_BAK" || die "could not back up $JUPITER"
+		asroot install -m 0755 "$WORK/payload/steam-jupiter.patched" "$JUPITER" || die "could not write $JUPITER"
+		ok "launcher updated (previous copy at $JUPITER_BAK)"
+	fi
+
+	# The canonical copy is what the re-patch script restores FROM. Without it the
+	# repair reports "canonical or jupiter missing" and does nothing, so the stock
+	# launcher - the one that runs `rm -rf --one-file-system "$STEAM_DIR"` - comes
+	# back after any Steam package or SteamOS image update and stays there.
+	asroot mkdir -p "$(dirname "$JUPITER_CANON")" || die "could not create $(dirname "$JUPITER_CANON")"
+	asroot install -m 0755 "$WORK/payload/steam-jupiter.patched" "$JUPITER_CANON" \
+		|| die "could not write $JUPITER_CANON"
+	ok "patched launcher kept at $JUPITER_CANON (repair source)"
+
+	return 0
+}
+
+patch_bin_steam() {
+	step "Patching bin_steam.sh"
+	if [ ! -f "$BIN_STEAM" ]; then warn "$BIN_STEAM not found — skipping"; return 0; fi
+
+	local patched; patched=$(mktemp)
+	awk -v line="$AUDIT_LINE" '
+		NR==1 {print; print line; next}
+		/^[[:space:]]*export[[:space:]]+LD_AUDIT=.*(SLSsteam|ZeroDay)/ {next}
+		{print}
+	' "$BIN_STEAM" > "$patched"
+	if cmp -s "$patched" "$BIN_STEAM"; then
+		rm -f "$patched"; ok "LD_AUDIT already current"; return 0
+	fi
+	asroot cp -p "$BIN_STEAM" "$BIN_STEAM.bak-zeroday-$TS" || die "could not back up $BIN_STEAM"
+	asroot install -m 0755 "$patched" "$BIN_STEAM" || die "could not patch $BIN_STEAM"
+	rm -f "$patched"
+	ok "LD_AUDIT layer added"
+}
+
+install_repatch() {
+	step "Installing the re-patch hook"
+	asroot mkdir -p "$(dirname "$REPATCH_DST")" || die "could not create the repair directory"
+	asroot install -m 0755 "$WORK/payload/zeroday-repatch.sh" "$REPATCH_DST" || die "could not install $REPATCH_DST"
+
+	if [ "$FAMILY" = "steamos" ] || [ "$FAMILY" = "bazzite" ] || [ "$FAMILY" = "cachyos" ] || [ "$FAMILY" = "arch" ]; then
+		asroot mkdir -p "$(dirname "$HOOK_DST")"
+		asroot install -m 0644 "$WORK/payload/zeroday-steam.hook" "$HOOK_DST" || die "could not install the hook"
+		ok "pacman hook installed (re-patches after steam package updates)"
+	else
+		warn "not an Arch-family system — no pacman hook; re-run this installer after a Steam update"
+	fi
+
+	install_repatch_service
+}
+
+# A pacman hook only fires for package updates. SteamOS updates the whole system
+# image instead, which puts the stock launcher and bin_steam.sh back without any
+# package transaction — so without this the mod quietly stops loading after the
+# first OS update and nothing repairs it.
+install_repatch_service() {
+	local dir="$HOME/.config/systemd/user"
+	local unit="$dir/zeroday-repatch.service"
+
+	if ! command -v systemctl >/dev/null 2>&1; then
+		warn "systemctl not found — no login-time repair; re-run this installer after a system update"
+		return 0
+	fi
+
+	mkdir -p "$dir"
+	cat > "$unit" <<EOF
+[Unit]
+Description=Put steam-jupiter and the LD_AUDIT layer back after a system update
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/sudo -n $REPATCH_DST
+
+[Install]
+WantedBy=graphical-session.target
+EOF
+
+	systemctl --user daemon-reload >/dev/null 2>&1 || true
+
+	install_repatch_sudoers
+	if systemctl --user enable --now zeroday-repatch.service >/dev/null 2>&1; then
+		ok "login-time repair enabled (re-patches after system and image updates)"
+	else
+		warn "could not enable the login-time repair — the pacman hook still covers steam package updates"
+	fi
+
+}
+
+# The repair unit runs `sudo -n`. A Deck whose owner set a password (a secondhand
+# unit, for example) fails that call quietly, and the next image update leaves
+# the stock launcher in place. The rule is only this one script.
+install_repatch_sudoers() {
+	[ -n "$SUDO" ] || return 0
+	local who tmp dest
+	who="$(id -un 2>/dev/null || true)"
+	case "$who" in
+		''|*[!A-Za-z0-9._-]*) warn "not writing a sudoers rule for user '${who:-?}'"; return 0 ;;
+	esac
+	dest="/etc/sudoers.d/zeroday-repatch"
+	tmp="$(mktemp)"
+	printf '%s\n' "$who ALL=(root) NOPASSWD: $REPATCH_DST" > "$tmp"
+	if ! asroot visudo -cf "$tmp" >/dev/null 2>&1; then
+		rm -f "$tmp"
+		warn "could not install a passwordless rule for the login repair"
+		return 0
+	fi
+	asroot install -m 0440 "$tmp" "$dest" || { rm -f "$tmp"; warn "could not write $dest"; return 0; }
+	rm -f "$tmp"
+	ok "login repair can run without a second password prompt"
+}
+
+write_steam_cfg() {
+	step "Blocking Steam client updates"
+	local roots=() r
+	for r in "$HOME/.steam/steam" "$HOME/.local/share/Steam" \
+	         "$HOME/.var/app/com.valvesoftware.Steam/.local/share/Steam"; do
+		[ -d "$r" ] && roots+=("$r")
+	done
+	[ "${#roots[@]}" -gt 0 ] || { warn "no Steam directory found"; return 0; }
+	for r in "${roots[@]}"; do
+		if [ -f "$r/steam.cfg" ] && grep -q "BootStrapperInhibitAll" "$r/steam.cfg"; then
+			ok "already blocked in $r"
+			continue
+		fi
+		# Never clobber a steam.cfg somebody else put there. Keep it so that
+		# --uninstall can hand it back exactly as it was.
+		if [ -f "$r/steam.cfg" ]; then
+			cp -p "$r/steam.cfg" "$r/steam.cfg.bak-zeroday-$TS"
+			ok "kept your existing steam.cfg as steam.cfg.bak-zeroday-$TS"
+		fi
+		cat > "$r/steam.cfg" <<-'EOF'
+			BootStrapperInhibitAll=enable
+			BootStrapperForceSelfUpdate=disable
+		EOF
+		ok "blocked in $r"
+	done
+}
+
+install_plugin() {
+	step "Installing the Decky plugin"
+	if [ "$OPT_PLUGIN" -eq 0 ]; then warn "skipped (--no-plugin)"; return 0; fi
+	if [ ! -d "$HOME/homebrew" ]; then
+		warn "Decky Loader does not look installed (no ~/homebrew) — skipping the plugin"
+		warn "install Decky Loader, then run this installer again to get the plugin"
+		return 0
+	fi
+	if [ ! -d "$WORK/payload/ZeroDay-plugin" ]; then
+		warn "payload has no plugin — skipping"
+		return 0
+	fi
+
+	if [ -d "$DECKY_PLUGINS/$DECKY_PLUGIN_NAME" ]; then
+		asroot cp -a "$DECKY_PLUGINS/$DECKY_PLUGIN_NAME" "$ZERODAY_DIR/plugin-backup-$TS" 2>/dev/null || true
+		asroot rm -rf "$DECKY_PLUGINS/$DECKY_PLUGIN_NAME"
+	fi
+	# A Decky that has never had a plugin from outside its own store may have no
+	# plugins/ directory yet. Without this the copy fails, and because the
+	# launcher is already patched by now that failure aborts the whole install.
+	asroot mkdir -p "$DECKY_PLUGINS" || die "could not create $DECKY_PLUGINS"
+	asroot cp -a "$WORK/payload/ZeroDay-plugin" "$DECKY_PLUGINS/$DECKY_PLUGIN_NAME" \
+		|| die "could not install the plugin into $DECKY_PLUGINS"
+	asroot chown -R root:root "$DECKY_PLUGINS/$DECKY_PLUGIN_NAME" 2>/dev/null || true
+	ok "plugin in place"
+
+	restart_decky
+}
+
+# Restart Decky Loader, and make sure the old plugin host is actually gone.
+#
+# A plain `systemctl restart` is not enough. systemd notices that the previous
+# plugin host is still alive ("Unit process N (ZeroDay) remains running after
+# unit stopped"), then reports "Found left-over process ... Ignoring" and starts
+# the new instance anyway. That orphan keeps running the OLD plugin code with no
+# supervisor, and on the first real install one of them ballooned to 4.1 GB
+# before it was caught. So: stop, wait for the cgroup to drain, force anything
+# still breathing, then start.
+# Whatever the unit leaves behind: the plugin hosts, and the loader itself.
+#
+# The unit is KillMode=process, so `systemctl stop` kills only the main process.
+# The "Decky Loader v3.x" supervisor that process spawned is re-parented to init
+# and keeps running, with every plugin host still hanging off it. Start a second
+# loader next to that one and the two fight over the same plugin sockets — which
+# is what an empty, flapping or half-dead Decky UI looks like afterwards.
+DECKY_PROC_PATTERN="homebrew/(services/PluginLoader|plugins/.*/main\.py)"
+
+restart_decky() {
+	systemctl cat plugin_loader.service >/dev/null 2>&1 || return 0
+
+	asroot systemctl stop plugin_loader.service >/dev/null 2>&1 || true
+
+	local i=0
+	while [ "$i" -lt 30 ]; do
+		pgrep -f "$DECKY_PROC_PATTERN" >/dev/null 2>&1 || break
+		sleep 1; i=$((i + 1))
+	done
+
+	# Exact PIDs from a Decky-only pattern, and through asroot: v3 runs the
+	# plugin hosts as the user but older builds run them as root, and a plain
+	# kill just fails with EPERM on the latter. No `pkill -f` here — a pattern
+	# on the command line of the killer matches the killer's own shell.
+	local p left=""
+	for p in $(pgrep -f "$DECKY_PROC_PATTERN" 2>/dev/null || true); do
+		[ "$p" = "$$" ] && continue
+		warn "reaping left-over Decky process $p"
+		asroot kill -9 "$p" 2>/dev/null || true
+		left="$left $p"
+	done
+	[ -n "$left" ] && sleep 1
+	if pgrep -f "$DECKY_PROC_PATTERN" >/dev/null 2>&1; then
+		warn "a Decky process survived the reap — restart Decky from its settings if the UI looks wrong"
+	fi
+
+	if asroot systemctl start plugin_loader.service >/dev/null 2>&1; then
+		ok "Decky Loader restarted cleanly"
+	else
+		warn "could not restart Decky — restart it from the Decky settings"
+	fi
+}
+
+# ------------------------------------------------------------------ uninstall
+do_uninstall() {
+	step "Uninstalling ZeroDay"
+	stop_steam
+
+	# Restoring the stock launcher, bin_steam.sh and removing the hook all write
+	# into /usr, which SteamOS keeps read-only. Without this the copies fail, every
+	# one of them is guarded with && or || true, and the uninstall reports success
+	# while the LD_AUDIT line stays in bin_steam.sh and the mod keeps loading.
+	ensure_system_writable
+
+	local newest b
+	newest=""
+	while IFS= read -r b; do
+		if ! grep -qE 'zeroday-jupiter-revision|LD_AUDIT=.*ZeroDay' "$b"; then newest=$b; break; fi
+	done < <(ls -1t "$JUPITER".bak-zeroday-* "$JUPITER".bak-syu-* 2>/dev/null || true)
+	if [ -n "$newest" ]; then
+		asroot cp -p "$newest" "$JUPITER" || die "could not restore $JUPITER from $newest"
+		ok "stock launcher restored from $newest"
+	else
+		warn "no launcher backup found — leaving $JUPITER alone"
+	fi
+
+	b=""
+	while IFS= read -r newest; do
+		if ! grep -qE 'LD_AUDIT=.*(ZeroDay|SLSsteam)' "$newest"; then b=$newest; break; fi
+	done < <(ls -1t "$BIN_STEAM".bak-zeroday-* "$BIN_STEAM".bak-syu-* 2>/dev/null || true)
+	if [ -n "$b" ]; then
+		asroot cp -p "$b" "$BIN_STEAM" || die "could not restore $BIN_STEAM from $b"
+		ok "bin_steam.sh restored"
+	else
+		asroot sed -i -E '/^[[:space:]]*export[[:space:]]+LD_AUDIT=.*(SLSsteam|ZeroDay)/d' "$BIN_STEAM" || die "could not remove the audit layer"
+		ok "removed the audit layer (no clean launcher backup)"
+	fi
+
+	asroot rm -f "$REPATCH_DST" "$HOOK_DST" || die "could not remove the re-patch hook"
+	asroot rm -f "$JUPITER_CANON" || die "could not remove $JUPITER_CANON"
+	# /etc/sudoers.d is often mode 0700. A plain rm there prints "Permission
+	# denied" even when the file was never written. Only touch it when we can.
+	if [ -n "$SUDO" ] || [ -w /etc/sudoers.d ]; then
+		asroot rm -f /etc/sudoers.d/zeroday-repatch || true
+	fi
+	ok "re-patch hook removed"
+
+	# The login-time repair has to go too, or it keeps firing at a script that is
+	# no longer there and fails on every login.
+	if command -v systemctl >/dev/null 2>&1; then
+		systemctl --user disable --now zeroday-repatch.service >/dev/null 2>&1 || true
+	fi
+	rm -f "$HOME/.config/systemd/user/zeroday-repatch.service"
+	if command -v systemctl >/dev/null 2>&1; then
+		systemctl --user daemon-reload >/dev/null 2>&1 || true
+	fi
+	ok "login-time repair removed"
+
+	# The proxy is ours too: its unit, and the script the unit runs.
+	if command -v systemctl >/dev/null 2>&1; then
+		systemctl --user disable --now zeroday-mrc-proxy.service >/dev/null 2>&1 || true
+	fi
+	rm -f "$HOME/.config/systemd/user/zeroday-mrc-proxy.service"
+	rm -f "$ZERODAY_DIR/wudrm-proxy.py"
+	if command -v systemctl >/dev/null 2>&1; then
+		systemctl --user daemon-reload >/dev/null 2>&1 || true
+	fi
+	ok "manifest-code proxy removed"
+
+	if [ -d "$DECKY_PLUGINS/$DECKY_PLUGIN_NAME" ]; then
+		asroot rm -rf "$DECKY_PLUGINS/$DECKY_PLUGIN_NAME"
+		restart_decky
+		ok "plugin removed"
+	fi
+
+	local r prev
+	for r in "$HOME/.steam/steam" "$HOME/.local/share/Steam"; do
+		[ -f "$r/steam.cfg" ] || continue
+		rm -f "$r/steam.cfg"
+		prev="$(ls -1t "$r"/steam.cfg.bak-zeroday-* 2>/dev/null | head -1 || true)"
+		if [ -n "$prev" ]; then
+			mv -f "$prev" "$r/steam.cfg"
+			ok "steam.cfg restored from $(basename "$prev")"
+		else
+			ok "removed $r/steam.cfg"
+		fi
+	done
+
+	if [ -f "$ZERODAY_DIR/created-steamrt64-marker" ]; then
+		local marker
+		IFS= read -r marker < "$ZERODAY_DIR/created-steamrt64-marker" || true
+		if [ "$marker" = "$STEAM_ROOT/.steam-enable-steamrt64-client" ]; then rm -f -- "$marker"; fi
+		rm -f "$ZERODAY_DIR/created-steamrt64-marker"
+	fi
+
+	# Libraries only. The ticket cache and your SLS config are yours — we leave them.
+	rm -f "$ZERODAY_LIB" "$ZERODAY_INJECT"
+	ok "libraries removed (config and ticket cache kept)"
+
+	start_steam
+	step "Uninstalled"
+	log "ZeroDay has been removed. Config kept at $CONFIG_FILE"
+}
+
+# ----------------------------------------------------------------------- main
+main() {
+	trap 'ui_restore; exit 130' INT
+	trap 'ui_restore; exit 143' TERM
+	if [ "$OPT_PREVIEW" -eq 1 ]; then ui_preview; return; fi
+	trap cleanup_on_failure EXIT
+	mkdir -p "$ZERODAY_DIR"
+	exec 8>"$ZERODAY_DIR/install.lock"
+	flock -n 8 || die "another ZeroDay installation is already running"
+	touch "$ZERODAY_LOG"
+	to_log "=== ZeroDay installer $TS ==="
+
+	if [ "$OPT_UNINSTALL" -eq 1 ]; then
+		ui_arm uninstall || die "cancelled"
+	else
+		case "$(uname -m)" in
+			x86_64|amd64) : ;;
+			*) die "ZeroDay.so requires x86-64; $(uname -m) is not supported" ;;
+		esac
+		ui_arm install || die "cancelled"
+	fi
+
+	if [ "$INTERACTIVE" -eq 1 ] && [ "$UI_LIVE" -eq 1 ]; then
+		UI_PHASE="checking the machine"
+		if [ "$UI_PCT" -lt 40 ]; then
+			UI_PCT=40
+		fi
+		ui_draw_progress
+	fi
+
+	detect_distro
+	find_steam_root
+	init_sudo
+	prime_sudo
+
+	if [ "$OPT_UNINSTALL" -eq 1 ]; then
+		do_uninstall
+		ui_hold
+		return 0
+	fi
+
+	fetch_payload
+	validate_runtime
+	begin_transaction
+
+	stop_steam
+
+	# Before anything is written: rescue the user's state out of a previous
+	# SLSsteam install and clear the old libraries out of the way.
+	migrate_old_install
+
+	install_libs
+	select_runtime
+	merge_config
+	install_mrc_proxy
+	mrc_fallback_config
+	ensure_system_writable
+	patch_jupiter    || warn "launcher not patched — the plugin still works, the .so will not load"
+	patch_bin_steam
+	install_repatch
+	write_steam_cfg
+
+	# Decky first (install it only if it is missing), then clear out any build
+	# this replaces, then lay ours down.
+	if [ "$OPT_PLUGIN" -eq 1 ]; then
+		ensure_decky
+		remove_previous_plugins
+		install_plugin
+	fi
+
+	# Everything landed. Disarm the rollback. Keep the terminal restore on the
+	# way out if we have not already put the screen back.
+	TX_ACTIVE=0
+
+	start_steam
+
+	step "Done"
+	log "libraries  $ZERODAY_DIR"
+	log "config     $CONFIG_FILE"
+	log "log        $ZERODAY_LOG"
+	ui_hold
+	cat <<-EOF
+		ZeroDay is installed.
+
+		  libraries   $ZERODAY_DIR
+		  config      $CONFIG_FILE
+		  launcher    $(grep -q zeroday-jupiter-revision "$JUPITER" 2>/dev/null && echo "patched" || echo "NOT patched")
+		  plugin      $([ -d "$DECKY_PLUGINS/$DECKY_PLUGIN_NAME" ] && echo "installed" || echo "skipped")
+		  log         $ZERODAY_LOG
+
+		Open the store, pick a game, and use GET GAME. In a game's Manage menu
+		there is a Remuvo entry to force a fresh ticket on the next launch.
+	EOF
+}
+
+ui_hold() {
+	[ "$INTERACTIVE" -eq 1 ] || return 0
+	local key
+	while IFS= read -rsn1 -t 0.01 -u "$UI_FD" key; do :; done || true
+	UI_PHASE="press any key"
+	UI_PCT=1000
+	ui_draw_progress
+	while true; do
+		ui_key
+		key=$UI_KEY
+		case "$key" in
+			$'\034')
+				UI_WORK=0
+				ui_frames_build
+				ui_draw_progress
+				;;
+			$'\035') ;;
+			*) break ;;
+		esac
+	done
+	ui_restore
+}
+
+main "$@"
