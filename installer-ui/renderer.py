@@ -609,18 +609,20 @@ class Screen:
                 return ImageFont.truetype("DejaVuSans.ttf", size)
             except OSError:
                 return ImageFont.load_default()
-        x, y = round(width*.16), round(height*.17)
-        available_width = width-2*x
-        bottom = round(height*.83)
+        # Keep the left edge clear of the feathers. The right side and tighter
+        # paragraph spacing leave room for substantially larger body text.
+        x, y = round(width*.16), round(height*.16)
+        available_width = round(width*.90)-x
+        bottom = round(height*.84)
         hint = "A / Enter: continue     B / Esc: abort"
-        # Reduce the font, not the copy. Blank paragraph gaps take half a line.
-        for size in range(min(20, max(10, round(self.ch*.85))), 3, -1):
+        # Reduce the font, not the copy. Keep paragraph gaps compact.
+        for size in range(min(22, max(14, round(self.ch*1.1))), 3, -1):
             body, title = font(size), font(size+3)
-            line_height = math.ceil(size*1.4)
+            line_height = math.ceil(size*1.2)
             plan, cursor = [], y
             for index, paragraph in enumerate(self.disclaimer_text.strip().splitlines()):
                 if not paragraph:
-                    cursor += max(2, round(size*.5))
+                    cursor += max(2, round(size*.25))
                     continue
                 face = title if index == 0 else body
                 color = GOLD if index == 0 else INK
@@ -635,14 +637,14 @@ class Screen:
                 wrapped.append(line)
                 for line in wrapped:
                     plan.append((cursor, line, face, color))
-                    cursor += math.ceil((size+3)*1.4) if index == 0 else line_height
+                    cursor += math.ceil((size+3)*1.2) if index == 0 else line_height
             if cursor+line_height*2 <= bottom and draw.textlength(hint, font=body) <= available_width:
                 break
         # Keep the whole block centered in the safe interior of the frame.
         offset = max(0, (bottom-cursor-line_height*2)//2)
         self.disclaimer_font_size = size
         self.disclaimer_card_lines = [line for _, line, _, _ in plan]
-        self.disclaimer_card_bounds = (x, y+offset, width-x, cursor+offset+line_height*2)
+        self.disclaimer_card_bounds = (x, y+offset, x+available_width, cursor+offset+line_height*2)
         for row, line, face, color in plan:
             draw.text((x, row+offset), line, font=face, fill=color, anchor="lt")
         draw.text((x, cursor+offset+line_height), hint, font=body, fill=MUTED, anchor="lt")

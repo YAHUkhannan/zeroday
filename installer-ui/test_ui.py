@@ -283,10 +283,12 @@ class Disclaimer(unittest.TestCase):
                     width, height, *_ = screen.disclaimer_layout()
                     left, top, right, bottom = screen.disclaimer_card_bounds
                     self.assertGreaterEqual(left, round(width*.16))
-                    self.assertGreaterEqual(top, round(height*.17))
-                    self.assertLessEqual(right, width-round(width*.16))
-                    self.assertLessEqual(bottom, round(height*.83))
+                    self.assertGreaterEqual(top, round(height*.16))
+                    self.assertLessEqual(right, round(width*.90))
+                    self.assertLessEqual(bottom, round(height*.84))
                     self.assertLess(screen.disclaimer_font_size, screen.ch)
+                    if (cols, rows) == (140, 43):
+                        self.assertGreaterEqual(screen.disclaimer_font_size, 16)
                     self.assertEqual(screen.disclaimer_scroll_limit, 0)
                     self.assertEqual(screen.disclaimer_offset, 0)
                     self.assertNotIn("INSTALLER PREVIEW", "".join(writes))
