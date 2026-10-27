@@ -15,6 +15,7 @@ import termios
 import threading
 import time
 import unittest
+from unittest import mock
 import fcntl
 
 ROOT = Path(__file__).resolve().parent
@@ -147,6 +148,7 @@ ui_fetch "$2" "$3" 0 1000
             proc.stdin.close()
             data = bytearray()
             entered = stopped = False
+            entered_at = 0
             deadline = time.monotonic() + 12
             try:
                 while proc.poll() is None and time.monotonic() < deadline:
@@ -165,6 +167,7 @@ ui_fetch "$2" "$3" 0 1000
                     if not entered and cancel != "gate" and b"INSTALLER PREVIEW" in data:
                         os.write(master, b"\r")
                         entered = True
+                        entered_at = time.monotonic()
                     if cancel is True and not stopped and b"Downloading preview-download" in data:
                         os.kill(proc.pid, signal.SIGTERM)
                         stopped = True
@@ -203,6 +206,49 @@ ui_fetch "$2" "$3" 0 1000
 
 
 class Render(unittest.TestCase):
+    def test_install_fades_words_then_moves_banner_down_without_resizing(self):
+        screen = renderer.Screen(1, ROOT/"assets")
+        writes = []
+        screen.send = writes.append
+        with mock.patch.object(renderer.os, "get_terminal_size", return_value=os.terminal_size((110, 36))):
+            screen.render(10)
+            banner = screen.static["banner"]
+            first = writes[-1]
+            original_row = int(renderer.re.search(r"\x1b\[(\d+);\d+H", first).group(1))
+            writes.clear()
+            with mock.patch.object(renderer.time, "monotonic", return_value=10):
+                screen.accept(b"state\x1fInstalling\x1f500\x1f\x1fbusy")
+            screen.render(10.4)
+            self.assertNotIn("\x1b[2J", writes[-1])
+            self.assertIn("INSTALL ZERODAY", writes[-1])
+            screen.render(10.9)
+            screen.render(12)
+            self.assertIn("\x1b[2J", writes[-1])
+            self.assertNotIn("INSTALL ZERODAY", writes[-1])
+            self.assertNotIn("Installing", writes[-1])
+            screen.render(13.4)
+            self.assertIn("Installing", writes[-1])
+            self.assertEqual(screen.static["banner"], banner)
+            final_row = int(renderer.re.search(r"\x1b\[(\d+);\d+H", writes[-1]).group(1))
+            self.assertGreater(final_row, original_row)
+
+    def test_gate_and_finished_screen_do_not_redraw_while_idle(self):
+        screen = renderer.Screen(1, ROOT/"assets")
+        writes = []
+        screen.send = writes.append
+        with mock.patch.object(renderer.os, "get_terminal_size", return_value=os.terminal_size((80, 24))):
+            screen.render(1)
+            count = len(writes)
+            screen.render(2)
+            self.assertEqual(len(writes), count)
+            screen = renderer.Screen(1, ROOT/"assets")
+            screen.send = writes.append
+            screen.accept(b"state\x1fFinished\x1f1000\x1f\x1fdone")
+            screen.render(3)
+            count = len(writes)
+            screen.render(4)
+            self.assertEqual(len(writes), count)
+
     def test_original_assets_are_byte_identical(self):
         for name, expected in [
             ("zeroday-banner.png", "c76a4ce27916018c5d9733b7323b93a1de5791d2d4f7ad3dcbd103ba0c88c82e"),

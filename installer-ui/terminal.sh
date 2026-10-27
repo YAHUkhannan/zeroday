@@ -72,9 +72,9 @@ ui_start() {
 		UI_BACKGROUND_OLD=${BASH_REMATCH[1]}
 		ui '\033]11;#faf9f5\a'
 	fi
-	rm -f "$UI_TMP/events"
+	rm -f "$UI_TMP/events" "$UI_TMP/screen-ready"
 	mkfifo -m 600 "$UI_TMP/events"
-	python3 "$UI_TMP/renderer.py" --fd "$UI_FD" --assets "$UI_TMP/assets" --cell-width "$cw" --cell-height "$ch" "${graphics[@]}" < "$UI_TMP/events" 2>"$UI_TMP/renderer.log" &
+	python3 "$UI_TMP/renderer.py" --fd "$UI_FD" --assets "$UI_TMP/assets" --ready-file "$UI_TMP/screen-ready" --cell-width "$cw" --cell-height "$ch" "${graphics[@]}" < "$UI_TMP/events" 2>"$UI_TMP/renderer.log" &
 	UI_PID=$!
 	exec 5>"$UI_TMP/events"
 	trap 'UI_RESIZE=1' WINCH
@@ -158,6 +158,12 @@ ui_arm() {
 				[ "$selection" -eq 0 ] || return 1
 				UI_LIVE=1; UI_PCT=0; UI_PHASE="Getting ready"
 				ui_draw_progress
+				# Finish the visual transition before a password prompt or another
+				# interactive installer can take ownership of the terminal.
+				while [ ! -f "$UI_TMP/screen-ready" ]; do
+					kill -0 "$UI_PID" 2>/dev/null || return 1
+					sleep 0.05
+				done
 				return 0 ;;
 		esac
 		ui_send gate "$UI_MODE" "$selection"

@@ -18,7 +18,9 @@ The download stays in a temporary directory and is deleted when the preview clos
 
 Downloads show received bytes, transfer rate and an estimated time remaining when a total is available. A server that does not report a size gets an animated activity indicator and received bytes, without a made-up percentage. Redirects cannot supply the final file's size. A failed transfer preserves an existing destination and removes its partial file.
 
-The animation runs independently of installer steps. Resizing redraws the layout. Closing the preview restores the terminal screen, keyboard settings, cursor and background color. No terminal profile is edited.
+The banner begins near the top. Pressing Install fades the words out over 0.8 seconds, then moves the banner down over 2.4 seconds before revealing progress beneath it. The banner keeps its size throughout. SIXEL movement uses cached pixel offsets, so it does not recalculate the full image on each animation frame. Synchronized terminal updates prevent partially drawn frames.
+
+The animation runs independently of installer steps, reuses its image palette and redraws only the filling track. Idle screens do not repeatedly redraw. Resizing adjusts the layout. Closing the preview restores the terminal screen, keyboard settings, cursor and background color. No terminal profile is edited.
 
 Requirements: Bash, Python 3 and curl. Pillow (`python3-pillow` on many distributions) enables the artwork; without it, the progress bar works in text. SIXEL terminals display detailed images, and other UTF-8 truecolor terminals use half-block artwork.
 
