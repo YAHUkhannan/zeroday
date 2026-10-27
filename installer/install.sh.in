@@ -55,6 +55,7 @@ JUPITER_CANON="${ZERODAY_JUPITER_CANON:-/usr/local/share/zeroday/steam-jupiter.p
 BIN_STEAM="${ZERODAY_BIN_STEAM:-/usr/lib/steam/bin_steam.sh}"
 REPATCH_DST="${ZERODAY_REPATCH_DST:-/usr/local/bin/zeroday-repatch.sh}"
 HOOK_DST="${ZERODAY_HOOK_DST:-/etc/pacman.d/hooks/zeroday-steam.hook}"
+DMI_ROOT="${ZERODAY_DMI_ROOT:-/sys/devices/virtual/dmi/id}"
 
 AUDIT_LINE='export LD_AUDIT="$HOME/.local/share/ZeroDay/library-inject.so:$HOME/.local/share/ZeroDay/ZeroDay.so"; export STEAM_FORCE_CLIENT=steamrt64'
 
@@ -485,26 +486,30 @@ start_steam() {
 	fi
 
 	step "Starting Steam"
-	# Game Mode is handled above. Desktop launches use the regular desktop
-	# arguments; the patched Jupiter adds -steamdeck only for -gamepadui.
+	# Preserve Deck hardware identity even with the desktop interface. In
+	# particular, the custom desktop launcher must receive this flag too.
+	local deck_args=() vendor product
+	vendor=$(cat "$DMI_ROOT/board_vendor" 2>/dev/null || true)
+	product=$(cat "$DMI_ROOT/product_name" 2>/dev/null || true)
+	case "$vendor:$product" in Valve:Jupiter|Valve:Galileo) deck_args=(-steamdeck) ;; esac
 	if [ -x "$HOME/.local/bin/steam-desktop" ]; then
-		nohup "$HOME/.local/bin/steam-desktop" -silent >/dev/null 2>&1 8>&- &
+		nohup "$HOME/.local/bin/steam-desktop" "${deck_args[@]}" -silent >/dev/null 2>&1 8>&- &
 		ok "launched via steam-desktop"
 	elif [ "$FAMILY" = "steamos" ] || [ "$FAMILY" = "bazzite" ]; then
 		if [ -x "$JUPITER" ]; then
 			nohup "$JUPITER" >/dev/null 2>&1 8>&- &
 			ok "launched via $JUPITER"
 		elif command -v steam >/dev/null 2>&1; then
-			nohup steam >/dev/null 2>&1 8>&- &
+			nohup steam "${deck_args[@]}" >/dev/null 2>&1 8>&- &
 			ok "launched via steam"
 		else
 			warn "no launcher found — start Steam yourself"
 		fi
 	elif [ -x /usr/lib/steam/steam ]; then
-		nohup /usr/lib/steam/steam >/dev/null 2>&1 8>&- &
+		nohup /usr/lib/steam/steam "${deck_args[@]}" >/dev/null 2>&1 8>&- &
 		ok "launched via /usr/lib/steam/steam"
 	elif command -v steam >/dev/null 2>&1; then
-		nohup steam >/dev/null 2>&1 8>&- &
+		nohup steam "${deck_args[@]}" >/dev/null 2>&1 8>&- &
 		ok "launched via steam"
 	else
 		warn "no launcher found — start Steam yourself"

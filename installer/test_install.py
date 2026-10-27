@@ -10,6 +10,7 @@ import subprocess
 import tarfile
 import tempfile
 import threading
+import time
 import unittest
 
 DIST = Path(__file__).resolve().parents[1]
@@ -58,8 +59,9 @@ class Install(unittest.TestCase):
         path = self.root/'bin'/name
         path.write_text('#!/bin/bash\n'+body+'\n'); path.chmod(0o755)
 
-    def run_install(self, *flags, fail=False, download=False):
-        args = ['bash', str(INSTALLER), '--yes', '--no-restart']
+    def run_install(self, *flags, fail=False, download=False, restart=False):
+        args = ['bash', str(INSTALLER), '--yes']
+        if not restart: args += ['--no-restart']
         if not download and '--uninstall' not in flags: args += ['--local', str(DIST)]
         process = subprocess.run(args+list(flags), env=self.env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=35)
         (self.root/'last-run.log').write_text(process.stdout)
@@ -176,7 +178,7 @@ class Install(unittest.TestCase):
             subprocess.run(['bash', str(launcher), *args], env=self.env, check=True,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         launch('-silent')
-        self.assertEqual(log.read_text(), 'steamrt64\n-silent\n')
+        self.assertEqual(log.read_text(), 'steamrt64\n-steamdeck\n-silent\n')
         log.unlink()
         self.stub('pgrep', 'printf "%s\\n" "$*" > "$TEST_ROOT/pgrep-args"\necho 999999')
         self.stub('ps', 'echo Sl')
@@ -188,6 +190,25 @@ class Install(unittest.TestCase):
         self.assertTrue(log.exists())
         launch('-gamepadui', '-steampal', '-steamos3')
         self.assertEqual(log.read_text(), 'steamrt64\n-steamdeck\n-gamepadui\n-steamos3\n')
+
+    def test_installer_restart_preserves_deck_identity(self):
+        dmi = self.root/'dmi';dmi.mkdir()
+        self.env['ZERODAY_DMI_ROOT'] = str(dmi)
+        launcher = self.home/'.local/bin/steam-desktop'
+        launcher.parent.mkdir(parents=True)
+        launcher.write_text('#!/bin/bash\nprintf "%s\\n" "$@" > "$HOME/restart-args"\n')
+        launcher.chmod(0o755)
+        result = self.home/'restart-args'
+        for vendor, product, expected in [('Valve','Galileo','-steamdeck\n-silent\n'),('Other','Desktop','-silent\n')]:
+            with self.subTest(vendor=vendor,product=product):
+                (dmi/'board_vendor').write_text(vendor+'\n')
+                (dmi/'product_name').write_text(product+'\n')
+                result.unlink(missing_ok=True)
+                self.run_install('--no-plugin',restart=True)
+                for attempt in range(100):
+                    if result.exists(): break
+                    time.sleep(.01)
+                self.assertEqual(result.read_text(),expected)
 
     def test_proxy_update_restarts_running_service(self):
         self.stub('systemctl', 'printf "%s\\n" "$*" >> "$TEST_ROOT/services.log"\nexit 0')

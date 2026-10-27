@@ -85,7 +85,8 @@ Native libraries and the Decky plugin are distributed in release assets.
   are verified before changes, library replacement uses a new inode, and failed
   installations restore previous files. Recovery copies survive a failed restore.
 - Launcher repair upgrades older audit exports and selects the matching 64-bit
-  client. Desktop launches keep desktop arguments, zombies do not block startup,
+  client. Deck launches preserve `-steamdeck` in both desktop and Game Mode, including
+  restarts through a custom desktop launcher. Zombies do not block startup,
   and shutdown does not start a second forwarding client.
 - `--no-plugin` preserves all plugin directories. Proxy updates restart the
   service. Uninstall selects clean backups and preserves a pre-existing runtime
