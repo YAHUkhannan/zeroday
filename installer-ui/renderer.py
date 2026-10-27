@@ -4,7 +4,7 @@
 Records on stdin are separated by RS (0x1e); fields by US (0x1f).
   gate <install|uninstall|preview> <selection>
   disclaimer <install|uninstall|preview>
-  disclaimer-next / disclaimer-back
+  disclaimer-next / disclaimer-back / disclaimer-scroll
   state <phase> <0..1000|-1> <detail> <busy|done|error>
   log <kind> <message>
   stop
@@ -138,7 +138,11 @@ class Sounds:
 
     def close(self):
         if self.thread:
-            self.drained.wait(1.3)
+            # A confirmation is longer than the cancel cue. Let the final
+            # button press finish even when it immediately closes the UI.
+            with self.lock:
+                remaining = max(0, len(self.current)-self.offset) / (48000*2*2)
+            self.drained.wait(remaining+.15)
             self.stopped.set()
             self.thread.join(timeout=.5)
 
@@ -361,14 +365,13 @@ class Screen:
         self.disclaimer_started = None
         self.disclaimer_leaving = None
         self.disclaimer_signature = None
-        self.disclaimer_last = False
-        self.disclaimer_step = 1
+        self.disclaimer_scroll_limit = 0
         self.opening_started = None
 
-    def reading_ready(self, last):
+    def reading_ready(self):
         if self.ready_file:
             target = self.ready_file.with_name("disclaimer-ready")
-            value = f"{self.disclaimer_offset}:{int(last)}"
+            value = str(self.disclaimer_offset)
             if not target.exists() or target.read_text() != value:
                 target.write_text(value)
 
@@ -484,13 +487,15 @@ class Screen:
             self.disclaimer_started = self.disclaimer_leaving = None
             self.disclaimer_signature = self.layout_key = None
             self.opening_started = None
-        elif fields[0] in ("disclaimer-next", "disclaimer-back"):
+        elif fields[0] in ("disclaimer-next", "disclaimer-back", "disclaimer-scroll"):
             if self.disclaimer and self.disclaimer_leaving is None:
-                if fields[0] == "disclaimer-next" and self.disclaimer_last:
+                if fields[0] == "disclaimer-next":
+                    self.sounds.play("confirm")
                     self.disclaimer_leaving = time.monotonic()
                 else:
-                    delta = self.disclaimer_step * (1 if fields[0] == "disclaimer-next" else -1)
-                    self.disclaimer_offset = max(0, self.disclaimer_offset + delta)
+                    delta = 1 if fields[0] == "disclaimer-scroll" else -1
+                    self.disclaimer_offset = min(self.disclaimer_scroll_limit,
+                                                 max(0, self.disclaimer_offset + delta))
                     self.disclaimer_signature = None
             return True
         elif fields[0] == "gate" and len(fields) == 3:
@@ -555,8 +560,8 @@ class Screen:
         return True
 
     def disclaimer_layout(self):
-        # Fit the original frame without stretching it. Native terminal text
-        # remains sharp in SIXEL and half-block terminals alike.
+        # Fit the original frame without stretching it. SIXEL uses smaller
+        # pixel text to fit the entire disclaimer onto this one card.
         width = max(1, self.cols - 2) * self.cw
         height = max(1, self.rows - 2) * self.ch
         ratio = 1672 / 941
@@ -572,7 +577,7 @@ class Screen:
         text_width = max(1, columns-2*margin)
         bottom = top + max(2, int(image_rows*.82))
         if text_width < 24 or bottom-y < 6:
-            # Very narrow/short windows retain all copy through pagination.
+            # Small/text-only terminals use a single scrollable document.
             x, y, text_width, bottom = 2, 2, max(1, self.cols-3), max(4, self.rows-1)
             framed = False
         else:
@@ -581,11 +586,67 @@ class Screen:
         for paragraph in self.disclaimer_text.strip().splitlines():
             lines.extend(textwrap.wrap(paragraph, text_width, subsequent_indent="  " if paragraph.startswith("- ") else "",
                                        break_long_words=True, break_on_hyphens=False) or [""])
-        capacity = max(1, bottom-y-2)
-        self.disclaimer_offset = min(self.disclaimer_offset, max(0, len(lines)-1))
-        self.disclaimer_step = capacity
-        self.disclaimer_last = self.disclaimer_offset + capacity >= len(lines)
+        capacity = max(1, bottom-y-4)
+        card = self.use_sixel and self.art and width >= 400 and height >= 240
+        self.disclaimer_scroll_limit = 0 if card else max(0, len(lines)-capacity)
+        self.disclaimer_offset = min(self.disclaimer_offset, self.disclaimer_scroll_limit)
         return (width, height, left, top, x, y, text_width, capacity, framed, lines)
+
+    def disclaimer_card(self, width, height):
+        frame = self.art.disclaimer_frame.resize((width, height), Image.Resampling.LANCZOS)
+        draw = ImageDraw.Draw(frame)
+        font_path = next((p for p in (
+            "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans.ttf",
+            "/usr/share/fonts/TTF/Hack-Regular.ttf",
+        ) if Path(p).is_file()), None)
+        def font(size):
+            if font_path:
+                return ImageFont.truetype(font_path, size)
+            # Pillow also searches standard font directories by filename.
+            try:
+                return ImageFont.truetype("DejaVuSans.ttf", size)
+            except OSError:
+                return ImageFont.load_default()
+        x, y = round(width*.16), round(height*.17)
+        available_width = width-2*x
+        bottom = round(height*.83)
+        hint = "A / Enter: continue     B / Esc: abort"
+        # Reduce the font, not the copy. Blank paragraph gaps take half a line.
+        for size in range(min(20, max(10, round(self.ch*.85))), 3, -1):
+            body, title = font(size), font(size+3)
+            line_height = math.ceil(size*1.4)
+            plan, cursor = [], y
+            for index, paragraph in enumerate(self.disclaimer_text.strip().splitlines()):
+                if not paragraph:
+                    cursor += max(2, round(size*.5))
+                    continue
+                face = title if index == 0 else body
+                color = GOLD if index == 0 else INK
+                wrapped, line = [], ""
+                for word in paragraph.split():
+                    candidate = (line+" "+word) if line.strip() else line+word
+                    if line.strip() and draw.textlength(candidate, font=face) > available_width:
+                        wrapped.append(line)
+                        line = ("  " if paragraph.startswith("- ") else "")+word
+                    else:
+                        line = candidate
+                wrapped.append(line)
+                for line in wrapped:
+                    plan.append((cursor, line, face, color))
+                    cursor += math.ceil((size+3)*1.4) if index == 0 else line_height
+            if cursor+line_height*2 <= bottom and draw.textlength(hint, font=body) <= available_width:
+                break
+        # Keep the whole block centered in the safe interior of the frame.
+        offset = max(0, (bottom-cursor-line_height*2)//2)
+        self.disclaimer_font_size = size
+        self.disclaimer_card_lines = [line for _, line, _, _ in plan]
+        self.disclaimer_card_bounds = (x, y+offset, width-x, cursor+offset+line_height*2)
+        for row, line, face, color in plan:
+            draw.text((x, row+offset), line, font=face, fill=color, anchor="lt")
+        draw.text((x, cursor+offset+line_height), hint, font=body, fill=MUTED, anchor="lt")
+        return frame
 
     def render_disclaimer(self, tick, redraw, parts):
         if self.disclaimer_started is None:
@@ -606,8 +667,17 @@ class Screen:
         if signature == self.disclaimer_signature and not redraw:
             return
         self.disclaimer_signature = signature
-        # Konsole can discard SIXEL rows when native text on them changes.
-        # Restore the cached frame with each page as well as each fade step.
+        card = self.use_sixel and self.art and width >= 400 and height >= 240
+        if card:
+            frame_key = ("disclaimer-card", width, height)
+            frame = self.disclaimer_card(width, height) if frame_key not in self.static else None
+            parts.append(self.fade_image(frame, top, left, opacity, frame_key))
+            self.send("".join(parts))
+            if opacity == 1 and self.disclaimer_leaving is None:
+                self.reading_ready()
+            return
+        # A continuous text fallback keeps every line reachable even without
+        # SIXEL or in a very small window. Enter always continues immediately.
         if framed and self.art:
             frame_key = ("disclaimer-frame", width, height)
             frame = self.art.disclaimer_frame.resize((width, height), Image.Resampling.LANCZOS) if frame_key not in self.static else None
@@ -618,14 +688,13 @@ class Screen:
             color = GOLD if self.disclaimer_offset+i == 0 else INK
             rgb = ";".join(str(round(c*opacity)) for c in color)
             parts.append(f"{ESC}[{y+i};{x}H{ESC}[48;2;0;0;0m{ESC}[38;2;{rgb}m{value:<{text_width}}{ESC}[0m")
-        hint = "Enter: continue" if self.disclaimer_last else "Enter: next page"
-        hint += " / Up: back / Q: abort"
-        hint = hint[:text_width]
+        hints = ("A/Enter: continue", "Up/Down: scroll", "B/Esc: abort")
         rgb = ";".join(str(round(c*opacity)) for c in MUTED)
-        parts.append(f"{ESC}[{y+capacity+1};{x}H{ESC}[48;2;0;0;0m{ESC}[38;2;{rgb}m{hint:<{text_width}}{ESC}[0m")
+        for i, hint in enumerate(hints):
+            parts.append(f"{ESC}[{y+capacity+1+i};{x}H{ESC}[48;2;0;0;0m{ESC}[38;2;{rgb}m{hint[:text_width]:<{text_width}}{ESC}[0m")
         self.send("".join(parts))
         if opacity == 1 and self.disclaimer_leaving is None:
-            self.reading_ready(self.disclaimer_last)
+            self.reading_ready()
 
     def prepare_motion(self, banner):
         key = banner.size
@@ -730,7 +799,10 @@ class Screen:
         for col,label in ((left,verb),(right,"ABORT")):
             buttons += (f"{ESC}[{label_row+9};{col}H{ESC}[48;2;0;0;0m"
                         f"{ESC}[38;2;{button_color[0]};{button_color[1]};{button_color[2]}m{label:^9}{ESC}[0m")
-        hint = "INSTALLER PREVIEW · Enter to try / arrows to choose / Q to close" if self.mode == "preview" else "Enter to continue / arrows to choose / Q to close"
+        hint = "A/Enter: confirm · B/Esc: abort"
+        navigation = "D-pad/arrows: choose"
+        if self.mode == "preview":
+            navigation = "INSTALLER PREVIEW · " + navigation
         return "".join([
             self.text(label_row, "ZERODAY", color(INK)),
             self.text(label_row+2, "SERPENTS // DOVES", color(MUTED)),
@@ -738,6 +810,7 @@ class Screen:
             self.text(label_row+5, "Mattith'YAHU 10:16", color(MUTED)),
             buttons,
             self.text(label_row+11, hint, color(MUTED)),
+            self.text(label_row+12, navigation, color(MUTED)),
         ])
 
     def transition(self, tick, top, col, drop, label_row, banner):
@@ -835,7 +908,8 @@ class Screen:
             parts += [self.text(1, "ZeroDay", GOLD), self.text(3, self.phase)]
             parts.append(self.text(min(self.rows, 5), self.detail or "Resize the window for artwork", MUTED))
             if self.gate:
-                parts.append(self.text(min(self.rows, 7), "Enter: continue   Q: cancel"))
+                parts.append(self.text(min(self.rows, 7), "A/Enter: confirm"))
+                parts.append(self.text(min(self.rows, 8), "B/Esc: abort"))
                 if self.opening_started is not None:
                     self.opening_started = None
             self.send("".join(parts))

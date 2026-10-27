@@ -1346,7 +1346,7 @@ ui_hold() {
 	[ "$INTERACTIVE" -eq 1 ] || return 0
 	local key
 	while IFS= read -rsn1 -t 0.01 -u "$UI_FD" key; do :; done || true
-	UI_PHASE="press any key"
+	UI_PHASE="A/Enter: close"
 	UI_PCT=1000
 	ui_draw_progress
 	while true; do
@@ -1359,7 +1359,8 @@ ui_hold() {
 				ui_draw_progress
 				;;
 			$'\035') ;;
-			*) break ;;
+			$'\025'|$' ') ui_send sound confirm; break ;;
+			*) ui_send sound cancel; break ;;
 		esac
 	done
 	ui_restore

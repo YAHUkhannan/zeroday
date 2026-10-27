@@ -145,7 +145,8 @@ ui_key() {
 		$'\033')
 			if ui_read_char 0.05; then rest=$UI_CHAR; fi
 			if ui_read_char 0.05; then rest+=$UI_CHAR; fi
-			UI_KEY=$rest ;;
+			# Steam Deck's standard desktop layout sends Escape for B.
+			UI_KEY=${rest:-q} ;;
 		*) UI_KEY=$key ;;
 	esac
 }
@@ -172,6 +173,9 @@ ui_arm() {
 			'[A'|'[D')
 				rm -f "$UI_TMP/disclaimer-ready"
 				ui_send disclaimer-back ;;
+			'[B'|'[C')
+				rm -f "$UI_TMP/disclaimer-ready"
+				ui_send disclaimer-scroll ;;
 		esac
 	done
 	# A queued first Enter must follow the opening paint, so it still gets
@@ -261,6 +265,7 @@ ui_preview() {
 		ui_fetch "$UI_TMP/preview-download" "$OPT_PREVIEW_URL" 0 1000 || {
 			ui_send log fail "Download failed; no installation was performed"
 			ui_key >/dev/null
+			ui_send sound confirm
 			return 1
 		}
 	else
@@ -271,8 +276,12 @@ ui_preview() {
 			sleep 0.07
 		done
 	fi
-	ui_send state "Preview complete" 1000 "R to replay / any other key to close" done
+	ui_send state "Preview complete" 1000 "A/Enter: close / Y/Space: replay" done
 	ui_key >/dev/null
-	case "$UI_KEY" in r|R) ;; *) return 0 ;; esac
+	case "$UI_KEY" in
+		r|R|$' ') ui_send sound confirm ;;
+		$'\025') ui_send sound confirm; return 0 ;;
+		*) ui_send sound cancel; return 0 ;;
+	esac
 	done
 }

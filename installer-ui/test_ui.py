@@ -177,7 +177,10 @@ ui_fetch "$2" "$3" 0 1000
                             continue
                         if page and page not in disclaimer_pages:
                             disclaimer_pages.add(page)
-                            if not (startup_entered and page.startswith("0:")):
+                            if cancel == "escape":
+                                os.write(master, b"\x1b")
+                                stopped = True
+                            elif not (startup_entered and page == "0"):
                                 os.write(master, b"\r")
                     if cancel == "disclaimer" and not stopped and b"ZeroDay" in data:
                         os.kill(proc.pid, signal.SIGTERM)
@@ -185,7 +188,10 @@ ui_fetch "$2" "$3" 0 1000
                     if cancel == "gate" and not stopped and b"INSTALLER PREVIEW" in data:
                         os.kill(proc.pid, signal.SIGTERM)
                         stopped = True
-                    if not entered and cancel not in ("gate", "disclaimer") and b"INSTALLER PREVIEW" in data:
+                    if cancel == "escape-gate" and not stopped and b"INSTALLER PREVIEW" in data:
+                        os.write(master, b"\x1b")
+                        stopped = True
+                    if not entered and cancel not in ("gate", "disclaimer", "escape", "escape-gate") and b"INSTALLER PREVIEW" in data:
                         os.write(master, b"\r")
                         entered = True
                         entered_at = time.monotonic()
@@ -193,9 +199,9 @@ ui_fetch "$2" "$3" 0 1000
                         os.kill(proc.pid, signal.SIGTERM)
                         stopped = True
                     elif not cancel and b"Preview complete" in data:
-                        os.write(master, b"q")
+                        os.write(master, b"\r")
                 self.assertIsNotNone(proc.poll(), "preview did not terminate")
-                self.assertEqual(proc.returncode, 143 if cancel else 0, data[-2000:])
+                self.assertEqual(proc.returncode, 143 if cancel in (True, "gate", "disclaimer") else 0, data[-2000:])
                 self.assertEqual(termios.tcgetattr(slave), before)
                 self.assertFalse(list(Path(tmp).glob("zeroday-ui.*")))
                 self.assertFalse((Path(tmp)/".local/share/ZeroDay").exists())
@@ -234,13 +240,36 @@ ui_fetch "$2" "$3" 0 1000
         data = self.terminal_preview(cancel="disclaimer")
         self.assertNotIn(b"INSTALLER PREVIEW", data)
 
+    def test_deck_b_escape_aborts_disclaimer_and_menu_without_installing(self):
+        for stage in ("escape", "escape-gate"):
+            with self.subTest(stage=stage):
+                data = self.terminal_preview(cancel=stage)
+                self.assertNotIn(b"Downloading preview-download", data)
+
 
 class Disclaimer(unittest.TestCase):
-    def test_all_copy_is_reachable_and_idle_page_does_not_redraw(self):
-        for cols, rows in ((110, 36), (80, 24), (40, 12), (24, 8)):
+    def test_disclaimer_continues_with_yes_once_without_paging(self):
+        screen = renderer.Screen(1, ROOT/"assets", intro=True)
+        screen.sounds = mock.Mock()
+        screen.art = None
+        writes = []
+        screen.send = writes.append
+        with mock.patch.object(renderer.os, "get_terminal_size", return_value=os.terminal_size((110, 36))):
+            screen.render(10)
+            screen.accept(b"disclaimer-back")
+            screen.sounds.play.assert_not_called()
+            screen.accept(b"disclaimer-next")
+            self.assertIsNotNone(screen.disclaimer_leaving)
+            screen.accept(b"disclaimer-next")  # Input during the fade is ignored.
+            screen.accept(b"disclaimer-back")
+            self.assertEqual(screen.sounds.play.call_args_list, [mock.call("confirm")])
+            self.assertIn("A/Enter: continue", writes[-1])
+            self.assertIn("B/Esc: abort", writes[-1])
+
+    def test_single_card_contains_all_copy_in_smaller_text_and_stays_idle(self):
+        for cols, rows in ((140, 43), (110, 36), (80, 24)):
             with self.subTest(size=(cols, rows)):
-                screen = renderer.Screen(1, ROOT/"assets", intro=True)
-                screen.art = None
+                screen = renderer.Screen(1, ROOT/"assets", use_sixel=True, intro=True)
                 writes = []
                 screen.send = writes.append
                 with mock.patch.object(renderer.os, "get_terminal_size", return_value=os.terminal_size((cols, rows))):
@@ -249,38 +278,57 @@ class Disclaimer(unittest.TestCase):
                     count = len(writes)
                     screen.render(13)
                     self.assertEqual(len(writes), count)
-                    collected = []
-                    for _ in range(100):
-                        *_, capacity, framed, lines = screen.disclaimer_layout()
-                        collected += lines[screen.disclaimer_offset:screen.disclaimer_offset+capacity]
-                        if screen.disclaimer_last:
-                            break
-                        screen.accept(b"disclaimer-next")
-                        screen.render(14)
-                    else:
-                        self.fail("pagination never reached the end")
-                    self.assertEqual(" ".join(" ".join(collected).split()),
+                    self.assertEqual(" ".join(" ".join(screen.disclaimer_card_lines).split()),
                                      " ".join(screen.disclaimer_text.split()))
+                    width, height, *_ = screen.disclaimer_layout()
+                    left, top, right, bottom = screen.disclaimer_card_bounds
+                    self.assertGreaterEqual(left, round(width*.16))
+                    self.assertGreaterEqual(top, round(height*.17))
+                    self.assertLessEqual(right, width-round(width*.16))
+                    self.assertLessEqual(bottom, round(height*.83))
+                    self.assertLess(screen.disclaimer_font_size, screen.ch)
+                    self.assertEqual(screen.disclaimer_scroll_limit, 0)
+                    self.assertEqual(screen.disclaimer_offset, 0)
                     self.assertNotIn("INSTALLER PREVIEW", "".join(writes))
-                    self.assertIn("Or does it?", " ".join(collected))
 
-    def test_resize_reflows_copy_and_back_returns_to_start(self):
-        screen = renderer.Screen(1, ROOT/"assets", intro=True)
-        screen.art = None
+    def test_text_fallback_is_one_scrollable_document_with_all_copy_reachable(self):
+        for cols, rows in ((110, 36), (80, 24), (40, 12), (24, 8)):
+            with self.subTest(size=(cols, rows)):
+                screen = renderer.Screen(1, ROOT/"assets", intro=True)
+                screen.art = None
+                screen.send = lambda value: None
+                with mock.patch.object(renderer.os, "get_terminal_size", return_value=os.terminal_size((cols, rows))):
+                    screen.render(10)
+                    collected = {}
+                    for _ in range(250):
+                        *_, capacity, framed, lines = screen.disclaimer_layout()
+                        for i in range(screen.disclaimer_offset, min(len(lines), screen.disclaimer_offset+capacity)):
+                            collected[i] = lines[i]
+                        if screen.disclaimer_offset == screen.disclaimer_scroll_limit:
+                            break
+                        screen.accept(b"disclaimer-scroll")
+                        screen.render(12)
+                    else:
+                        self.fail("scrolling never reached the end")
+                    self.assertEqual(" ".join(" ".join(collected[i] for i in sorted(collected)).split()),
+                                     " ".join(screen.disclaimer_text.split()))
+                    self.assertIn("Or does it?", " ".join(collected.values()))
+                    screen.accept(b"disclaimer-back")
+                    self.assertLess(screen.disclaimer_offset, screen.disclaimer_scroll_limit)
+
+    def test_resize_refits_single_card_without_creating_pages(self):
+        screen = renderer.Screen(1, ROOT/"assets", use_sixel=True, intro=True)
         screen.send = lambda value: None
         with mock.patch.object(renderer.os, "get_terminal_size", return_value=os.terminal_size((80, 24))):
             screen.render(10)
-            screen.accept(b"disclaimer-next")
-            screen.render(12)
-            self.assertGreater(screen.disclaimer_offset, 0)
+            smaller = screen.disclaimer_font_size
         with mock.patch.object(renderer.os, "get_terminal_size", return_value=os.terminal_size((110, 36))):
-            screen.render(13)
-            width = screen.disclaimer_layout()[6]
-            for _ in range(20):
-                screen.accept(b"disclaimer-back")
-                screen.render(14)
+            screen.render(12)
+            self.assertGreater(screen.disclaimer_font_size, smaller)
+            screen.accept(b"disclaimer-scroll")
+            screen.accept(b"disclaimer-back")
             self.assertEqual(screen.disclaimer_offset, 0)
-            self.assertGreater(width, 40)
+            self.assertEqual(screen.disclaimer_scroll_limit, 0)
 
     def test_fades_disclaimer_out_then_banner_in_before_menu_and_readiness(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -296,11 +344,6 @@ class Disclaimer(unittest.TestCase):
                 self.assertTrue(ready.with_name("disclaimer-ready").exists())
                 definitions = renderer.re.findall(r'#\d+;2;(\d+);(\d+);(\d+)', writes[-1])
                 self.assertTrue(any(any(int(c)>0 for c in rgb) for rgb in definitions))
-                screen.accept(b"disclaimer-next")
-                screen.render(11.4)
-                self.assertIn('"1;1;', writes[-1], "changing pages erased the SIXEL frame")
-                screen.disclaimer_offset = len(screen.disclaimer_layout()[-1])-1
-                screen.render(12)
                 with mock.patch.object(renderer.time, "monotonic", return_value=12):
                     screen.accept(b"disclaimer-next")
                 screen.render(12.4)
@@ -328,6 +371,11 @@ class Render(unittest.TestCase):
                        "be ye therefore wise as serpents, and harmless as doves",
                        "Mattith'YAHU 10:16", "INSTALL", "ABORT"):
             self.assertIn(phrase, words)
+        for mode in ("install", "uninstall", "preview"):
+            screen.mode = mode
+            words = screen.gate_words(15)
+            for hint in ("A/Enter: confirm", "B/Esc: abort", "D-pad/arrows: choose"):
+                self.assertIn(hint, words)
         for name in ("banner", "progress"):
             image = renderer.Image.open(ROOT/"assets"/f"zeroday-{name}-transparent.png")
             self.assertEqual(image.mode, "RGBA")
@@ -533,11 +581,28 @@ with open(sys.argv[1], "wb", buffering=0) as output:
                     sounds.play("move")
                     time.sleep(.04)
                     sounds.play("cancel")
+                    time.sleep(.04)
+                    sounds.play("confirm")
                 finally:
                     sounds.close()
                 self.assertEqual(launch.call_count, 1)
                 self.assertFalse(sounds.thread.is_alive())
                 self.assertIsNotNone(sounds.child.poll())
+                self.assertIn(sounds.clips["confirm"], raw.read_bytes(),
+                              "closing the UI cut off the final confirmation")
+
+    def test_deck_desktop_button_keys_and_keyboard_arrows(self):
+        command = '''source "$1"
+UI_PENDING_INPUT=$'\\r'; ui_key; printf '%q\\n' "$UI_KEY"
+UI_PENDING_INPUT=$'\\033'; ui_key; printf '%s\\n' "$UI_KEY"
+UI_PENDING_INPUT=$'\\033[C'; ui_key; printf '%s\\n' "$UI_KEY"
+UI_PENDING_INPUT=$'\\033[D'; ui_key; printf '%s\\n' "$UI_KEY"
+UI_PENDING_INPUT=' '; ui_key; printf '<%s>\\n' "$UI_KEY"
+'''
+        result = subprocess.run(["bash", "-c", command, "test", str(ROOT/"terminal.sh")],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, check=True)
+        self.assertEqual(result.stdout.splitlines(), ["$'\\025'", "q", "[C", "[D", "< >"])
 
     def test_startup_probe_keeps_interleaved_enter_and_arrows(self):
         master, slave = pty.openpty()
