@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "payload": {
-    "ZeroDay.so": "f8d31daa9126d7b9391fcae915c9af87648a797ccc2ce2b84a1f06a8774dc1f6",
+    "ZeroDay.so": "5203f52f2686229367843050f667711870819b8241cff90750bd87a533247753",
     "library-inject.so": "2005a9e8a4c18b3f5d3b397a2aaf4600831775701d91a9913cafcae11cb4cc56"
   },
   "clients": [

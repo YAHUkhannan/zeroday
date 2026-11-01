@@ -42,11 +42,11 @@ updating anyway leaves ZeroDay disabled.
 
 ## Latest release
 
-[**ZeroDay v1.3.0**](https://github.com/YAHUkhannan/zeroday/releases/latest)
-puts GET GAME, Remuvo and Remove game in the client. The installer no longer
-installs the Decky plugin, and an update moves an existing ZeroDay plugin
-out of Decky and keeps a copy. Steam build **1792618285** is still the
-validated client.
+[**ZeroDay v1.3.1**](https://github.com/YAHUkhannan/zeroday/releases/latest)
+improves subprocess timeouts, file-watch recovery, numeric parsing and logging.
+See the [release notes](docs/RELEASE-NOTES.md) for details and validation limits.
+Steam build **1792618285** remains the validated client. The in-client store
+and library menus remain included; the installer does not install Decky Loader.
 
 ## Documentation
 
