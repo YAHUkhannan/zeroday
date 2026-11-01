@@ -92,7 +92,7 @@ usage() {
 		  --local DIR      install from an unpacked payload directory (no download)
 		  --repo URL       override the release base URL
 		  --uninstall      remove ZeroDay and restore the stock launcher
-		  --no-plugin      skip the Decky plugin
+		  --no-plugin      leave Decky and its plugins unchanged
 		  --no-restart     leave Steam stopped when finished
 		  --yes, -y        never prompt
 		  --check          report Steam compatibility without installing
@@ -766,6 +766,25 @@ remove_previous_plugins() {
 	return 0
 }
 
+# The client paints GET GAME, Remuvo and Remove game. A plugin left in Decky
+# paints them again. Move it aside; do not delete it.
+retire_plugin() {
+	step "Retiring the Decky plugin"
+	local plugin="$DECKY_PLUGINS/$DECKY_PLUGIN_NAME"
+	if [ ! -d "$plugin" ]; then
+		ok "no ZeroDay plugin installed"
+		return 0
+	fi
+	mkdir -p "$ZERODAY_DIR"
+	local dest="$ZERODAY_DIR/decky-plugin-ZeroDay"
+	if [ -e "$dest" ]; then
+		dest="$ZERODAY_DIR/decky-plugin-ZeroDay-$TS"
+	fi
+	asroot mv "$plugin" "$dest" || die "could not move the ZeroDay plugin out of Decky"
+	ok "plugin saved at $dest"
+	restart_decky
+}
+
 # --------------------------------------------------------------- install bits
 install_libs() {
 	step "Installing libraries"
@@ -1430,12 +1449,12 @@ main() {
 	install_repatch
 	write_steam_cfg
 
-	# Decky first (install it only if it is missing), then clear out any build
-	# this replaces, then lay ours down.
+	# The store button and the Manage menu live in the library now. Do not
+	# install Decky or the plugin. An older ZeroDay plugin is moved aside so
+	# it cannot paint a second button. --no-plugin leaves Decky untouched.
 	if [ "$OPT_PLUGIN" -eq 1 ]; then
-		ensure_decky
 		remove_previous_plugins
-		install_plugin
+		retire_plugin
 	fi
 
 	# Everything landed. Disarm the rollback. Keep the terminal restore on the
@@ -1456,11 +1475,12 @@ main() {
 		  libraries   $ZERODAY_DIR
 		  config      $CONFIG_FILE
 		  launcher    $(grep -q zeroday-jupiter-revision "$JUPITER" 2>/dev/null && echo "patched" || echo "NOT patched")
-		  plugin      $([ -d "$DECKY_PLUGINS/$DECKY_PLUGIN_NAME" ] && echo "installed" || echo "skipped")
+		  plugin      $([ "$OPT_PLUGIN" -eq 0 ] && echo "left unchanged" || { [ -d "$DECKY_PLUGINS/$DECKY_PLUGIN_NAME" ] && echo "still present" || echo "not used"; })
 		  log         $ZERODAY_LOG
 
-		Open the store, pick a game, and use GET GAME. In a game's Manage menu
-		there is a Remuvo entry to force a fresh ticket on the next launch.
+		Open the store, pick a game, and use GET GAME. In a game's Manage menu,
+		Remuvo refreshes the ticket on the next launch and Remove game takes
+		the title back out. Decky Loader is not part of this.
 	EOF
 }
 

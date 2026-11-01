@@ -35,17 +35,18 @@ updating anyway leaves ZeroDay disabled.
 
 ## Included
 
-- Steam library and download integration, with an optional Decky plugin.
+- Steam library and download integration. GET GAME is on the store page. Remuvo and Remove game are in a game's Manage menu.
 - Cached launch tickets with background refresh.
 - Steam Deck support in Desktop Mode and Game Mode.
 - An animated installer with menu sounds, launcher repair and recovery on failure.
 
 ## Latest release
 
-[**ZeroDay v1.2.0**](https://github.com/YAHUkhannan/zeroday/releases/latest)
-adds Steam compatibility checks and supported automatic updates, and includes
-the latest native reload safeguard. Steam build **1792618285** is validated;
-the installer checks the actual native client and interface files.
+[**ZeroDay v1.3.0**](https://github.com/YAHUkhannan/zeroday/releases/latest)
+puts GET GAME, Remuvo and Remove game in the client. The installer no longer
+installs the Decky plugin, and an update moves an existing ZeroDay plugin
+out of Decky and keeps a copy. Steam build **1792618285** is still the
+validated client.
 
 ## Documentation
 

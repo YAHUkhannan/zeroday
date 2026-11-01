@@ -22,8 +22,9 @@ Steam is still running. The installer checks its download and client
 compatibility, closes Steam, installs ZeroDay and starts Steam again.
 
 Running the installer again updates an existing installation. Current config
-values, keys and ticket cache are kept; missing settings are added. An existing
-Decky Loader installation is reused.
+values, keys and ticket cache are kept; missing settings are added. Decky
+Loader is not installed or required. If a ZeroDay plugin is already in
+Decky, the installer moves that folder out and keeps the copy.
 
 If the installed Steam files match this release's validated client, Steam is
 left unchanged and only ZeroDay is updated. If Steam is incompatible, the
@@ -37,7 +38,7 @@ Steam and leaves ZeroDay disabled, including an existing mod installation;
 it does not install the new mod. Install a compatible ZeroDay release to
 enable it again. `--yes` does not accept this separate choice.
 
-Version 1.2.0 validates Steam build **1792618285** by checking the SHA-256 hashes
+Version 1.3.0 validates Steam build **1792618285** by checking the SHA-256 hashes
 of both `steamrt64/steamclient.so` and `steamrt64/steamui.so`. A newer build is
 not assumed compatible. Compatible installations need no update-manifest request.
 
@@ -56,7 +57,7 @@ bash install.sh --no-plugin
 | Option | Effect |
 | --- | --- |
 | `--yes` | Skip the opening choice. Administrator authentication can still be required. |
-| `--no-plugin` | Skip all Decky and plugin changes. |
+| `--no-plugin` | Leave Decky and its plugins unchanged. |
 | `--no-restart` | Leave Steam stopped after installation. |
 | `--uninstall` | Remove ZeroDay and restore clean launcher backups when available. |
 | `--check` | Print local Steam compatibility as JSON without installing or contacting a server. Exit 0 means compatible; 3 means unsupported. |

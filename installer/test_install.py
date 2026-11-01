@@ -107,7 +107,7 @@ class Install(unittest.TestCase):
         self.assertEqual((self.zd/'library-inject.so').read_bytes(), (PAYLOAD/'library-inject.so').read_bytes())
         self.assertEqual(self.jup.read_bytes(), (PAYLOAD/'steam-jupiter.patched').read_bytes())
         self.assertTrue((self.steam/'.steam-enable-steamrt64-client').exists())
-        self.assertTrue((self.plugins/'ZeroDay/main.py').exists())
+        self.assertFalse((self.plugins/'ZeroDay').exists())
         self.assertFalse((self.plugins/'Wally-Decky').exists())
         self.assertIn('CustomSetting: keep-me', self.config.read_text())
         self.assertIn('SmartTickets: 0x2', self.config.read_text())
@@ -123,6 +123,18 @@ class Install(unittest.TestCase):
         self.assertFalse((self.zd/'ZeroDay.so').exists())
         self.assertFalse((self.steam/'.steam-enable-steamrt64-client').exists())
         self.assertTrue(self.config.exists())
+        self.assert_clean()
+
+    def test_retires_existing_zeroday_plugin(self):
+        plugin = self.plugins/'ZeroDay'
+        plugin.mkdir()
+        (plugin/'main.py').write_text('old')
+        self.run_install()
+        self.assertFalse(plugin.exists())
+        saved = list(self.zd.glob('decky-plugin-ZeroDay*'))
+        self.assertEqual(len(saved), 1)
+        self.assertEqual((saved[0]/'main.py').read_text(), 'old')
+        self.assertEqual((self.plugins/'Unrelated/keep').read_text(), 'untouched')
         self.assert_clean()
 
     def test_no_plugin_preserves_all_plugin_directories(self):

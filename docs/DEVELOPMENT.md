@@ -3,8 +3,8 @@
 [← ZeroDay](../README.md)
 
 The installer backend is `installer/install.sh.in`. Its interface, artwork and
-audio are in `installer-ui/`. Native libraries and the Decky plugin are
-distributed in release assets. The launcher and its repair script are tracked
+audio are in `installer-ui/`. The native libraries are distributed in the
+release assets. The launcher and its repair script are tracked
 under `payload/`; the remaining payload files come from the validated release.
 
 ## Generate
@@ -64,7 +64,7 @@ compatibility. Update the payload hashes when releasing a new native build.
 Change `VERSION`, regenerate, and package into an explicit directory:
 
 ```sh
-./make-release.sh --selftest --output release-1.2.0
+./make-release.sh --selftest --output release-1.3.0
 bash release-1.2.0/install.sh --check
 ```
 

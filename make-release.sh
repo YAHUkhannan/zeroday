@@ -50,14 +50,13 @@ if grep -rqIE 'service_role|sb_secret_|service_key' "$DIST/payload" 2>/dev/null;
 	grep -rIlIE 'service_role|sb_secret_|service_key' "$DIST/payload" >&2
 	exit 1
 fi
-[ -d "$DIST/payload/ZeroDay-plugin" ] || { echo "missing payload/ZeroDay-plugin" >&2; exit 1; }
 [ -f "$DIST/payload/res/config.yaml" ] || { echo "missing payload/res/config.yaml" >&2; exit 1; }
 
 tar --exclude='__pycache__' --exclude='*.pyc' --exclude='*.pyo' --exclude='*.bak*' \
     -czf "$OUT/ZeroDay-payload.tar.gz" -C "$DIST" \
     payload/LICENSE payload/ZeroDay.so payload/library-inject.so \
     payload/steam-jupiter.patched payload/zeroday-repatch.sh payload/zeroday-steam.hook \
-    payload/wudrm-proxy.py payload/res/config.yaml payload/ZeroDay-plugin
+    payload/wudrm-proxy.py payload/res/config.yaml
 install -m 0755 "$DIST/install.sh" "$OUT/install.sh"
 
 ( cd "$OUT" && sha256sum install.sh ZeroDay-payload.tar.gz > SHA256SUMS )
