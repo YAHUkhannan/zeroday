@@ -8,7 +8,7 @@
 #   1. works out what kind of machine this is (SteamOS / Bazzite / CachyOS / Arch / other)
 #   2. downloads the payload and verifies its checksum
 #   3. checks Steam compatibility, then CLOSES STEAM and applies a supported update if needed
-#   4. verifies the client, installs the libraries, config, launcher and optional Decky plugin
+#   4. verifies the client, installs the libraries, config and launcher
 #   5. starts Steam again
 #
 # After that there is nothing to configure: open the store and grab a game.
@@ -19,7 +19,7 @@
 #   --local DIR      install from an unpacked payload directory (no download)
 #   --repo URL       override the release base URL
 #   --uninstall      remove ZeroDay AND restore the stock launcher + Steam config
-#   --no-plugin      skip the Decky plugin
+#   --no-plugin      leave an existing Decky install and its plugins unchanged
 #   --no-restart     leave Steam stopped when we are done
 #   --yes            skip the interactive screen
 #   --check          report Steam compatibility without installing
@@ -64,7 +64,6 @@ AUDIT_LINE='export LD_AUDIT="$HOME/.local/share/ZeroDay/library-inject.so:$HOME/
 
 DECKY_PLUGINS="${ZERODAY_DECKY_PLUGINS:-$HOME/homebrew/plugins}"
 DECKY_PLUGIN_NAME="ZeroDay"
-DECKY_INSTALLER_URL="${ZERODAY_DECKY_INSTALLER:-https://github.com/SteamDeckHomebrew/decky-installer/releases/latest/download/install_release.sh}"
 
 # Manifest-request-code proxy. The payload ships the script, a user unit runs it,
 # and the config template points MrcServer at it. MRC_FALLBACK is the public
@@ -155,9 +154,8 @@ ui_floor_step() {
 		"Patching bin_steam.sh") n=855 ;;
 		"Installing the re-patch hook") n=875 ;;
 		"Blocking Steam client updates") n=895 ;;
-		"Decky Loader") n=920 ;;
-		"Removing previous plugin builds") n=945 ;;
-		"Installing the Decky plugin") n=965 ;;
+		"Removing previous plugin builds") n=930 ;;
+		"Retiring the Decky plugin") n=960 ;;
 		"Starting Steam") n=985 ;;
 		"Uninstalling ZeroDay") n=200 ;;
 		"Uninstalled"|"Done") n=1000 ;;
@@ -677,67 +675,6 @@ migrate_old_install() {
 	fi
 }
 
-# ------------------------------------------------------------------ decky ----
-# Decky Loader: use the one that is already there, install it only if missing.
-#
-# An existing Decky must never be replaced, and neither must the plugins and
-# settings that live next to ours: ~/homebrew is the user's, not ours. So the
-# test for "is Decky here" is deliberately generous — a plugin-only install, a
-# hand-built one, or one whose unit has been renamed all count — and the *last*
-# word belongs to ~/homebrew itself: if that directory exists, we do not run
-# Decky's installer over it, whatever the markers say. Worst case the customer
-# is told to install Decky themselves; they never lose the one they have.
-ensure_decky() {
-	step "Decky Loader"
-	if [ -d "$HOME/homebrew/services" ] \
-		|| [ -d "$HOME/homebrew/plugins" ] \
-		|| [ -x "$HOME/homebrew/services/PluginLoader" ] \
-		|| systemctl cat plugin_loader.service >/dev/null 2>&1 \
-		|| pgrep -f "homebrew/services/PluginLoader" >/dev/null 2>&1; then
-		ok "already installed — leaving it alone"
-		return 0
-	fi
-
-	if [ -e "$HOME/homebrew" ]; then
-		warn "$HOME/homebrew exists but has none of Decky's usual pieces"
-		warn "that is not a plain Decky install, so I am leaving it alone"
-		warn "install/repair Decky Loader yourself, then re-run this installer"
-		return 0
-	fi
-
-	warn "Decky Loader is not installed"
-	if ! command -v jq >/dev/null 2>&1; then
-		warn "Decky's own installer needs jq and jq is missing — install Decky yourself"
-		return 0
-	fi
-
-	local dl="$ZERODAY_DIR/decky-installer.sh"
-	if ! ui_fetch "$dl" "$DECKY_INSTALLER_URL" "$UI_PCT" 950; then
-		warn "could not download Decky's installer — install Decky yourself"
-		return 0
-	fi
-
-	# Its first line is `exec sudo "$0"`, and it asks questions. It needs a real
-	# terminal — our stdin may be the script itself, so hand it /dev/tty.
-	if [ -e /dev/tty ]; then
-		# Decky's installer takes the terminal. The work screen is painted again after.
-		if [ "$INTERACTIVE" -eq 1 ]; then
-			UI_WORK=0
-			ui_pause
-		fi
-		if sh "$dl" < /dev/tty > /dev/tty 2>&1; then
-			ok "Decky Loader installed"
-		else
-			warn "Decky's installer did not finish — continuing without it"
-		fi
-	else
-		warn "no terminal available for Decky's installer — install Decky yourself"
-	fi
-	ui_draw_progress
-	rm -f "$dl"
-	return 0
-}
-
 # ------------------------------------------------- remove previous builds ----
 # Directory names this has shipped under before, or that it replaces. Decky
 # keys a plugin off its directory name, so these are what we look for.
@@ -1193,36 +1130,8 @@ write_steam_cfg() {
 	done
 }
 
-install_plugin() {
-	step "Installing the Decky plugin"
-	if [ "$OPT_PLUGIN" -eq 0 ]; then warn "skipped (--no-plugin)"; return 0; fi
-	if [ ! -d "$HOME/homebrew" ]; then
-		warn "Decky Loader does not look installed (no ~/homebrew) — skipping the plugin"
-		warn "install Decky Loader, then run this installer again to get the plugin"
-		return 0
-	fi
-	if [ ! -d "$WORK/payload/ZeroDay-plugin" ]; then
-		warn "payload has no plugin — skipping"
-		return 0
-	fi
-
-	if [ -d "$DECKY_PLUGINS/$DECKY_PLUGIN_NAME" ]; then
-		asroot cp -a "$DECKY_PLUGINS/$DECKY_PLUGIN_NAME" "$ZERODAY_DIR/plugin-backup-$TS" 2>/dev/null || true
-		asroot rm -rf "$DECKY_PLUGINS/$DECKY_PLUGIN_NAME"
-	fi
-	# A Decky that has never had a plugin from outside its own store may have no
-	# plugins/ directory yet. Without this the copy fails, and because the
-	# launcher is already patched by now that failure aborts the whole install.
-	asroot mkdir -p "$DECKY_PLUGINS" || die "could not create $DECKY_PLUGINS"
-	asroot cp -a "$WORK/payload/ZeroDay-plugin" "$DECKY_PLUGINS/$DECKY_PLUGIN_NAME" \
-		|| die "could not install the plugin into $DECKY_PLUGINS"
-	asroot chown -R root:root "$DECKY_PLUGINS/$DECKY_PLUGIN_NAME" 2>/dev/null || true
-	ok "plugin in place"
-
-	restart_decky
-}
-
-# Restart Decky Loader, and make sure the old plugin host is actually gone.
+# Restart an already-installed Decky Loader after its ZeroDay plugin was moved.
+# This does not download or install Decky. A machine without the unit is left alone.
 #
 # A plain `systemctl restart` is not enough. systemd notices that the previous
 # plugin host is still alive ("Unit process N (ZeroDay) remains running after
